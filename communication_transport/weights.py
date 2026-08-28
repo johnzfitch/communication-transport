@@ -28,6 +28,9 @@ class ModelWeights:
     positional_scheme: str
     rotary_dim: int
     rotary_base: float
+    # GPT-J rotates adjacent coordinate pairs (2j, 2j+1); GPT-NeoX (Pythia)
+    # rotates the split-half pairs (j, j + rotary_dim/2).
+    rotary_adjacent_pairs: bool = False
 
     def qk(self, layer: int, head: int) -> torch.Tensor:
         return self.Q[layer, head] @ self.K[layer, head].T
@@ -107,6 +110,7 @@ def extract_weights(model_name: str, model) -> ModelWeights:
         positional_scheme=str(cfg.positional_embedding_type),
         rotary_dim=int(getattr(cfg, "rotary_dim", 0) or 0),
         rotary_base=float(getattr(cfg, "rotary_base", 10_000.0) or 10_000.0),
+        rotary_adjacent_pairs=bool(getattr(cfg, "rotary_adjacent_pairs", False)),
     )
 
 

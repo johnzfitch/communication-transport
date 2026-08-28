@@ -161,6 +161,22 @@ def _causal_survival(
         "relative_logit_change": logit_change / max(logit_reference, 1.0e-300),
         "causal_natural_loss_change_subset": patch_loss - clean_loss,
     }
+    # Task-relevant projector: at every traced position, the unembedding
+    # direction of the actual next token (the continuation the position is
+    # supposed to predict), applied per position and pooled in norm.
+    token_targets = tokens.cpu()[:, 1:].reshape(-1)
+    directions = weights.W_U[:, token_targets].T.reshape(
+        tokens.shape[0], tokens.shape[1] - 1, weights.d_model
+    )
+    directions = directions / torch.linalg.vector_norm(
+        directions, dim=-1, keepdim=True
+    ).clamp_min(1.0e-12)
+
+    def projected_norm(difference: torch.Tensor) -> float:
+        aligned = difference.double()[:, :-1]
+        component = (aligned * directions).sum(dim=-1)
+        return float(torch.linalg.vector_norm(component))
+
     survival_rows = []
     for layer in range(rl, weights.n_layers):
         name = f"blocks.{layer}.hook_resid_pre"
@@ -175,7 +191,8 @@ def _causal_survival(
                 "channel": edge.channel,
                 "downstream_layer": layer,
                 "whole_stream_survival_ratio": float(torch.linalg.vector_norm(difference.double())) / max(reader_norm, 1.0e-300),
-                "target_projector": "identity",
+                "next_token_projected_survival_ratio": projected_norm(difference) / max(reader_norm, 1.0e-300),
+                "target_projector": "identity_plus_next_token_unembedding",
             }
         )
     final_difference = patched_cache[f"blocks.{weights.n_layers - 1}.hook_resid_post"] - clean_cache[f"blocks.{weights.n_layers - 1}.hook_resid_post"]
@@ -189,7 +206,8 @@ def _causal_survival(
             "channel": edge.channel,
             "downstream_layer": weights.n_layers,
             "whole_stream_survival_ratio": float(torch.linalg.vector_norm(final_difference.double())) / max(reader_norm, 1.0e-300),
-            "target_projector": "identity_final_residual",
+            "next_token_projected_survival_ratio": projected_norm(final_difference) / max(reader_norm, 1.0e-300),
+            "target_projector": "identity_plus_next_token_unembedding_final_residual",
         }
     )
     return summary, survival_rows
@@ -291,13 +309,18 @@ def run_realized_traffic(
         if causal:
             row.update(causal)
             final = [
-                value["whole_stream_survival_ratio"]
+                value
                 for value in survival_rows
                 if value["edge_id"] == row["edge_id"]
                 and value["downstream_layer"] == weights.n_layers
             ]
             if final:
-                row["survives_downstream_mixing"] = bool(final[0] >= 0.1)
+                row["survives_downstream_mixing"] = bool(
+                    final[0]["whole_stream_survival_ratio"] >= 0.1
+                )
+                row["survives_task_relevant"] = bool(
+                    final[0].get("next_token_projected_survival_ratio", math.nan) >= 0.1
+                )
     table = pd.concat(
         [pd.DataFrame(rows), pd.DataFrame(survival_rows)],
         ignore_index=True,

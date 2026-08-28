@@ -22,14 +22,29 @@ def rope_frequencies(weights: ModelWeights) -> np.ndarray:
 
 
 def rope_matrix(weights: ModelWeights, position: int) -> np.ndarray:
+    """Exact rotary operator in the model's own coordinate pairing.
+
+    GPT-J style rotates adjacent pairs (2j, 2j+1); GPT-NeoX (Pythia) rotates
+    the split-half pairs (j, j + rotary_dim/2).  Loop closure is convention
+    independent, but any insertion next to learned Q/K factors must act on the
+    coordinates the model actually rotates.
+    """
+
     dimension = weights.d_head
     result = np.eye(dimension, dtype=np.float64)
     frequencies = rope_frequencies(weights)
+    half = weights.rotary_dim // 2
     for plane, frequency in enumerate(frequencies):
         angle = position * frequency
         c, s = math.cos(angle), math.sin(angle)
-        index = 2 * plane
-        result[index : index + 2, index : index + 2] = ((c, -s), (s, c))
+        if weights.rotary_adjacent_pairs:
+            a, b = 2 * plane, 2 * plane + 1
+        else:
+            a, b = plane, plane + half
+        result[a, a] = c
+        result[a, b] = -s
+        result[b, a] = s
+        result[b, b] = c
     return result
 
 
@@ -148,12 +163,59 @@ def run_rope_transport(
                     weights.K[layer, head, :, : weights.rotary_dim].numpy(),
                 )
             )
-    visible_basis = np.linalg.qr(np.concatenate(visible_factors, axis=1))[0]
-    pos_basis = np.linalg.svd(positional_matrix, full_matrices=False)[2].T
+    # Concatenating every rotary-restricted factor column spans the full
+    # stream, which made every containment cosine 1.0 by construction.  The
+    # informative object is the SPECTRALLY TRUNCATED visible basis at declared
+    # energy thresholds, compared against equally truncated positional spans.
+    visible_stack = np.concatenate(visible_factors, axis=1)
+    visible_U, visible_s, _ = np.linalg.svd(visible_stack, full_matrices=False)
+    pos_U, pos_s, _ = np.linalg.svd(positional_matrix.T, full_matrices=False)
     pos_rank = _activation_rank(positional_matrix)
-    cos_pos = _principal_cosines(visible_basis, pos_basis[:, : max(1, min(pos_rank, visible_basis.shape[1]))])
+
+    def energy_rank(singular: np.ndarray, threshold: float) -> int:
+        energy = np.cumsum(singular**2)
+        return int(np.searchsorted(energy, threshold * energy[-1]) + 1)
+
+    energy_thresholds = (0.5, 0.9, 0.99)
+    visible_ranks = {
+        threshold: energy_rank(visible_s, threshold)
+        for threshold in energy_thresholds
+    }
     posratio = rw_planes.get("posratio_plane", np.empty((weights.d_model, 0)))
-    cos_rw = _principal_cosines(visible_basis, posratio)
+    for threshold in energy_thresholds:
+        r_visible = visible_ranks[threshold]
+        basis = visible_U[:, :r_visible]
+        for pos_threshold in energy_thresholds:
+            r_pos = energy_rank(pos_s, pos_threshold)
+            cosines = _principal_cosines(basis, pos_U[:, :r_pos])
+            rows.append(
+                {
+                    "model": weights.model_name,
+                    "positional_scheme": scheme,
+                    "control": "rope_visibility",
+                    "visible_energy_threshold": threshold,
+                    "visible_rank": r_visible,
+                    "positional_energy_threshold": pos_threshold,
+                    "positional_rank": r_pos,
+                    "min_principal_cosine": float(cosines.min()) if len(cosines) else math.nan,
+                    "mean_principal_cosine": float(cosines.mean()) if len(cosines) else math.nan,
+                }
+            )
+        cos_rw = _principal_cosines(basis, posratio)
+        rows.append(
+            {
+                "model": weights.model_name,
+                "positional_scheme": scheme,
+                "control": "rope_visibility",
+                "visible_energy_threshold": threshold,
+                "visible_rank": r_visible,
+                "positional_energy_threshold": math.nan,
+                "positional_rank": int(posratio.shape[1]),
+                "comparison_span": "posratio_plane",
+                "min_principal_cosine": float(cos_rw.min()) if len(cos_rw) else math.nan,
+                "mean_principal_cosine": float(cos_rw.mean()) if len(cos_rw) else math.nan,
+            }
+        )
     rows.append(
         {
             "model": weights.model_name,
@@ -165,11 +227,13 @@ def run_rope_transport(
             "rational_frequency_rank": _rational_frequency_rank(weights),
             "finite_window_dictionary_rank": _finite_dictionary_rank(weights, config.position_length),
             "learned_weight_visible_rank": _visible_weight_rank(weights),
+            "visible_rank_at_0_5_energy": visible_ranks[0.5],
+            "visible_rank_at_0_9_energy": visible_ranks[0.9],
+            "visible_rank_at_0_99_energy": visible_ranks[0.99],
             "activation_realized_rank": pos_rank,
+            "activation_rank_corpus_limited": bool(pos_rank >= config.position_length - 1),
             "pass_through_dimension": weights.d_head - weights.rotary_dim,
             "exact_loop_residual": exact_residual,
-            "minimum_positional_span_cosine_to_rope_visible": float(cos_pos.min()) if len(cos_pos) else math.nan,
-            "minimum_posratio_cosine_to_rope_visible": float(cos_rw.min()) if len(cos_rw) else math.nan,
         }
     )
 
@@ -179,12 +243,18 @@ def run_rope_transport(
     rng.shuffle(shuffled)
     def matrix_from_frequency(position, freq):
         result = np.eye(weights.d_head)
+        half = weights.rotary_dim // 2
         for plane, value in enumerate(freq):
             angle = position * value
-            result[2 * plane : 2 * plane + 2, 2 * plane : 2 * plane + 2] = (
-                (math.cos(angle), -math.sin(angle)),
-                (math.sin(angle), math.cos(angle)),
-            )
+            c, s = math.cos(angle), math.sin(angle)
+            if weights.rotary_adjacent_pairs:
+                a, b = 2 * plane, 2 * plane + 1
+            else:
+                a, b = plane, plane + half
+            result[a, a] = c
+            result[a, b] = -s
+            result[b, a] = s
+            result[b, b] = c
         return result
     shuffled_loop = (
         matrix_from_frequency(i_pos - j_pos, shuffled)
@@ -280,3 +350,4 @@ def run_rope_transport(
         ),
     ]
     return frame, observations
+

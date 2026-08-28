@@ -201,6 +201,18 @@ def run_interventions(
         "primary_single_heads": primary,
         "layer_matched_random_heads": random_heads,
     }
+    roles: dict[str, list[str]] = {}
+    for label in induction_heads:
+        roles.setdefault(label, []).append("induction")
+    roles.setdefault(copier, []).append("copier")
+    roles.setdefault(suppressor, []).append("suppressor")
+    roles.setdefault(previous, []).append("previous_token_candidate")
+    for label in random_heads:
+        roles.setdefault(label, []).append("layer_matched_random")
+
+    def role_of(label: str) -> str:
+        return "+".join(roles.get(label, ["unlabeled"]))
+
     rows: list[dict[str, object]] = []
     deletion_damage: dict[str, float] = {}
 
@@ -227,7 +239,14 @@ def run_interventions(
             spectral_metric=0.0,
             frame_metric=0.0,
             orientation_change=math.nan,
-            extra={"head_set": labels},
+            extra={
+                "head_set": labels,
+                "target_role": (
+                    "induction_community"
+                    if target == "induction_community"
+                    else role_of(target)
+                ),
+            },
         )
         rows.append(record)
         deletion_damage[target] = float(record["fraction_gain_destroyed"])
@@ -262,9 +281,14 @@ def run_interventions(
             frame_metric=0.0,
             orientation_change=2.0,
             extra={
+                "target_role": role_of(label),
+                "deletion_fraction_gain_destroyed": denominator,
+                # A ratio against a near-zero deletion effect is unbounded
+                # noise; emit it only when the denominator is material and
+                # keep the damage pair columns for every row.
                 "ratio_to_mean_ablation_damage": (
                     (1.0 - changed.induction_gain / clean.induction_gain) / denominator
-                    if math.isfinite(denominator) and abs(denominator) > 1.0e-12
+                    if math.isfinite(denominator) and abs(denominator) >= 0.01
                     else math.nan
                 ),
                 "copying_score_before": float(
@@ -306,6 +330,7 @@ def run_interventions(
                 orientation_change=0.0,
                 extra={
                     **flat_info,
+                    "target_role": role_of(label),
                     "max_relative_coupling_change": max_dc,
                 },
             )
@@ -335,7 +360,10 @@ def run_interventions(
                 spectral_metric=float(np.linalg.norm(projector)),
                 frame_metric=math.nan,
                 orientation_change=math.nan,
-                extra={"projector_dimension": int(np.asarray(plane).shape[1])},
+                extra={
+                    "projector_dimension": int(np.asarray(plane).shape[1]),
+                    "target_role": "positional_or_control_plane",
+                },
             )
         )
 

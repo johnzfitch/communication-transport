@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import math
 import traceback
@@ -27,7 +28,7 @@ from .model_io import (
     model_summary,
     unload_model,
 )
-from .operator_core import run_operator_experiments
+from .operator_core import run_operator_experiments, run_thomas_wigner_aggregate
 from .realized_traffic import run_realized_traffic
 from .report import generate_figures, render_report
 from .rope_transport import run_rope_transport
@@ -129,7 +130,13 @@ def _attempt(
     print(f"Running {label}...", flush=True)
     try:
         value = operation()
-        print(f"Completed {label}.", flush=True)
+        try:
+            import psutil
+
+            rss = psutil.Process().memory_info().rss / 2**30
+            print(f"Completed {label}. [rss {rss:.1f} GiB]", flush=True)
+        except Exception:
+            print(f"Completed {label}.", flush=True)
         return value
     except Exception as exc:
         message = f"{type(exc).__name__}: {exc}"
@@ -247,9 +254,13 @@ def run(config: RunConfig) -> Path:
             if corpora is not None:
                 detected = _attempt("behavioral induction-head readout", model_name, errors, lambda: detect_induction_heads(model, corpora, config))
                 if detected is not None:
-                    induction_heads, induction_scores = detected
+                    induction_heads, induction_scores, duplicate_scores = detected
                     summary["induction_heads"] = induction_heads
                     summary["induction_head_scores"] = induction_scores
+                    summary["duplicate_token_head_scores"] = duplicate_scores
+                    summary["duplicate_token_heads"] = sorted(
+                        duplicate_scores, key=duplicate_scores.get, reverse=True
+                    )[:5]
 
             rw = None
             need_rw = bool(
@@ -293,12 +304,37 @@ def run(config: RunConfig) -> Path:
                 if graph is not None:
                     tables["communities"].append(graph.communities)
                     triangle = graph.triangles.copy()
-                    triangle.insert(0, "row_kind", "v_triangle")
+                    if "row_kind" not in triangle.columns:
+                        triangle.insert(0, "row_kind", "v_triangle")
                     role = graph.role_loops.copy()
                     if len(role):
                         role.insert(0, "row_kind", "role_complete_qk_loop")
                     tables["triangles"].append(pd.concat([triangle, role], ignore_index=True, sort=False))
                     _append_observations(observations, "C", graph)
+                    if map_result is not None:
+                        aggregate_tw = _attempt(
+                            "aggregate Thomas-Wigner arm",
+                            model_name,
+                            errors,
+                            lambda: run_thomas_wigner_aggregate(
+                                weights, edges, graph.communities, config
+                            ),
+                        )
+                        if aggregate_tw is not None and len(aggregate_tw):
+                            tables["thomas_wigner"].append(aggregate_tw)
+                            valid_rows = aggregate_tw[
+                                aggregate_tw.get(
+                                    "local_error",
+                                    pd.Series(index=aggregate_tw.index, dtype=object),
+                                ).isna()
+                            ]
+                            if len(valid_rows) and "pair_formula_residual" in valid_rows:
+                                sentence = (
+                                    f"Aggregate pooled-Gram Thomas-Wigner pairs had genuine common support (median intersection {float(valid_rows['intersection_support_dimension'].median()):.0f}) "
+                                    f"and reproduced the rank-two pair law to {float(valid_rows['pair_formula_residual'].max()):.3e} radians."
+                                )
+                                observations["B"].append(sentence)
+                                print(f"Observed: {sentence}", flush=True)
 
             layer = None
             if map_result is not None and residual_activations and "layer_transport" in enabled:
@@ -311,7 +347,16 @@ def run(config: RunConfig) -> Path:
                 if layer is not None:
                     tables["layer_span_profiles"].append(layer.span_profiles)
                     tables["layer_transport_fits"].append(layer.fit_table)
-                    _prefix_arrays(arrays_transport, slug, layer.transports)
+                    # float64 stays inside the computation; the archived copy
+                    # is float32 to halve the cross-model commit footprint.
+                    _prefix_arrays(
+                        arrays_transport,
+                        slug,
+                        {
+                            name: np.asarray(value, dtype=np.float32)
+                            for name, value in layer.transports.items()
+                        },
+                    )
                     _append_observations(observations, "C", layer)
 
             interventions = None
@@ -399,6 +444,11 @@ def run(config: RunConfig) -> Path:
                     observations["D"].extend(sentences)
                     for sentence in sentences:
                         print(f"Observed: {sentence}", flush=True)
+
+            # The rope stage is the last consumer of the cached views;
+            # release them before the ablation-heavy stages.
+            residual_activations, normalized_activations, activations = {}, {}, None
+            gc.collect()
 
             clean = interventions.clean if interventions is not None else None
             if corpora is not None and graph is not None and map_result is not None and "ternary_synergy" in enabled:

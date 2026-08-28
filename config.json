@@ -7,7 +7,7 @@
   "experiments": [
     "all"
   ],
-  "output": ".",
+  "output": "R:\\albert-engine\\outputs\\full_run2",
   "device": "cuda",
   "seed": 0,
   "offline": true,
@@ -32,13 +32,17 @@
   ],
   "dense_crosscheck_edges": 12,
   "max_operator_edges_per_channel": 96,
-  "max_triangles_per_model": 24,
-  "max_synergy_triangles_per_model": 8,
+  "max_triangles_per_model": 200,
+  "max_synergy_triangles_per_model": 150,
   "max_realized_edges_per_model": 12,
   "max_mixed_edges_per_class": 5000,
   "max_neuron_wires": 100000,
   "neuron_hist_bins": 2001,
-  "surrogate_draws": 24,
+  "surrogate_draws": 100,
+  "triangle_surrogate_draws": 12,
+  "max_surrogate_triangles_per_draw": 48,
+  "max_matched_control_triangles": 200,
+  "transport_control_draws": 3,
   "bootstrap_draws": 24,
   "lie_ambient_dims": [
     8,
@@ -64,5 +68,5 @@
     52
   ],
   "candidate_carrier": null,
-  "source_spec": "transformer_communication_transport_experiment(2).md"
+  "source_spec": "C:\\Users\\johnz\\Downloads\\transformer_communication_transport_experiment(3).md + C:\\Users\\johnz\\Downloads\\message_to_agent.md"
 }

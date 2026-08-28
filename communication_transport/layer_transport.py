@@ -59,17 +59,25 @@ def _fit_one(
     }
 
 
-def fit_layer_transports(
+def _prepare_matrices(
     activations: dict[int, torch.Tensor], config: RunConfig
-) -> tuple[dict[str, np.ndarray], pd.DataFrame]:
+) -> tuple[list[int], dict[int, torch.Tensor], torch.Tensor, torch.Tensor, int]:
     layers = sorted(activations)
     matrices = {layer: _center_matrix(activations[layer]) for layer in layers}
+    sequence_length = int(next(iter(activations.values())).shape[1])
     n_positions = next(iter(matrices.values())).shape[1]
     rng = np.random.default_rng(config.seed + 501)
     order = rng.permutation(n_positions)
     split = max(1, min(n_positions - 1, int(config.transport_train_fraction * n_positions)))
     train_idx = torch.tensor(order[:split], dtype=torch.long)
     eval_idx = torch.tensor(order[split:], dtype=torch.long)
+    return layers, matrices, train_idx, eval_idx, sequence_length
+
+
+def fit_layer_transports(
+    activations: dict[int, torch.Tensor], config: RunConfig
+) -> tuple[dict[str, np.ndarray], pd.DataFrame]:
+    layers, matrices, train_idx, eval_idx, _ = _prepare_matrices(activations, config)
     device = config.device if torch.cuda.is_available() else "cpu"
     anchors = sorted(set((layers[0], layers[len(layers) // 2], layers[-1])))
     arrays: dict[str, np.ndarray] = {}
@@ -289,6 +297,33 @@ def weight_ot_transports(
     return arrays, rows
 
 
+def _compact_angle_norm(Q: np.ndarray) -> float:
+    angles = np.angle(np.linalg.eigvals(Q))
+    return float(math.sqrt(float(np.sum(angles**2))))
+
+
+def _fit_polar_on_indices(
+    matrices: dict[int, torch.Tensor],
+    anchor: int,
+    layer: int,
+    train_idx: torch.Tensor,
+    eval_idx: torch.Tensor,
+    ridge_multiplier: float,
+    device: str,
+    anchor_train_permutation: torch.Tensor | None = None,
+) -> tuple[np.ndarray, dict[str, float]]:
+    source_train = matrices[layer][:, train_idx].to(device)
+    anchor_train = matrices[anchor][:, train_idx].to(device)
+    if anchor_train_permutation is not None:
+        anchor_train = anchor_train[:, anchor_train_permutation.to(anchor_train.device)]
+    source_eval = matrices[layer][:, eval_idx].to(device)
+    anchor_eval = matrices[anchor][:, eval_idx].to(device)
+    compact, diagnostics = _fit_one(
+        source_train, anchor_train, source_eval, anchor_eval, ridge_multiplier
+    )
+    return compact.numpy(), diagnostics
+
+
 def run_layer_transport(
     weights: ModelWeights,
     edges: pd.DataFrame,
@@ -301,18 +336,177 @@ def run_layer_transport(
     ridge = config.transport_ridge_grid[1]
     covariant = covariant_couplings(weights, edges, transports, anchor, ridge)
     profiles = span_profiles(edges, covariant, config)
+    profiles["transport_control"] = "fitted"
+    profile_frames = [profiles]
+    extra_fit_rows: list[dict[str, object]] = []
+    device = config.device if torch.cuda.is_available() else "cpu"
+    layers, matrices, train_idx, eval_idx, sequence_length = _prepare_matrices(
+        residual_activations, config
+    )
+    rng = np.random.default_rng(config.seed + 517)
+
+    # Identity-transport control: collapse must be exactly zero by
+    # construction, so any deviation flags a bookkeeping bug.
+    identity_transports = {
+        _transport_key(anchor, layer, ridge): np.eye(weights.d_model)
+        for layer in layers
+    }
+    identity_cov = covariant_couplings(weights, edges, identity_transports, anchor, ridge)
+    identity_profiles = span_profiles(edges, identity_cov, config)
+    identity_profiles["transport_control"] = "identity"
+    profile_frames.append(identity_profiles)
+    identity_residual = float(
+        np.max(np.abs(identity_cov["C_covariant"].to_numpy() - identity_cov["C"].to_numpy()))
+    )
+    identity_collapse = float(
+        identity_profiles.groupby("edge_class")["collapse_fraction"].first().abs().max()
+    )
+
+    # Token-permuted correspondence: the fit-anything floor for the whole
+    # covariant-collapse computation.
+    permuted_collapses: list[float] = []
+    permuted_compact: dict[int, list[float]] = {layer: [] for layer in layers}
+    for draw in range(config.transport_control_draws):
+        permutation = torch.tensor(
+            rng.permutation(len(train_idx)), dtype=torch.long
+        )
+        draw_transports: dict[str, np.ndarray] = {}
+        for layer in layers:
+            compact, diagnostics = _fit_polar_on_indices(
+                matrices, anchor, layer, train_idx, eval_idx, ridge, device,
+                anchor_train_permutation=permutation,
+            )
+            draw_transports[_transport_key(anchor, layer, ridge)] = compact
+            permuted_compact[layer].append(_compact_angle_norm(compact))
+            extra_fit_rows.append(
+                {
+                    "model": weights.model_name,
+                    "transport_kind": "token_permuted_fit",
+                    "control_draw": draw,
+                    "anchor_layer": anchor,
+                    "source_layer": layer,
+                    "ridge_multiplier": ridge,
+                    **diagnostics,
+                }
+            )
+        permuted_cov = covariant_couplings(weights, edges, draw_transports, anchor, ridge)
+        permuted_profiles = span_profiles(edges, permuted_cov, config)
+        permuted_profiles["transport_control"] = f"token_permuted_{draw}"
+        profile_frames.append(permuted_profiles)
+        permuted_collapses.append(
+            float(permuted_profiles.groupby("edge_class")["collapse_fraction"].first().median())
+        )
+
+    # Random equal-size token partitions and the within-sequence bootstrap:
+    # transport-fit noise floors for the compact angle.
+    reference_compact = {
+        layer: transports[_transport_key(anchor, layer, ridge)] for layer in layers
+    }
+    partition_changes: dict[int, list[float]] = {layer: [] for layer in layers}
+    bootstrap_changes: dict[int, list[float]] = {layer: [] for layer in layers}
+    n_train = len(train_idx)
+    all_positions = torch.cat([train_idx, eval_idx])
+    position_sequences = (all_positions // sequence_length).numpy()
+    unique_sequences = np.unique(position_sequences)
+    for draw in range(config.bootstrap_draws):
+        partition = torch.tensor(
+            rng.choice(len(all_positions), n_train, replace=False), dtype=torch.long
+        )
+        partition_idx = all_positions[partition]
+        chosen = rng.choice(unique_sequences, len(unique_sequences), replace=True)
+        counts = np.bincount(chosen, minlength=int(unique_sequences.max()) + 1)
+        weights_per_position = counts[position_sequences]
+        bootstrap_positions = all_positions[
+            torch.tensor(np.repeat(np.arange(len(all_positions)), weights_per_position), dtype=torch.long)
+        ]
+        for layer in layers:
+            compact_p, _ = _fit_polar_on_indices(
+                matrices, anchor, layer, partition_idx, eval_idx, ridge, device
+            )
+            partition_changes[layer].append(
+                _compact_angle_norm(compact_p @ reference_compact[layer].T)
+            )
+            compact_b, _ = _fit_polar_on_indices(
+                matrices, anchor, layer, bootstrap_positions, eval_idx, ridge, device
+            )
+            bootstrap_changes[layer].append(
+                _compact_angle_norm(compact_b @ reference_compact[layer].T)
+            )
+    for layer in layers:
+        real_norm = _compact_angle_norm(reference_compact[layer])
+        boot = np.asarray(bootstrap_changes[layer])
+        part = np.asarray(partition_changes[layer])
+        perm = np.asarray(permuted_compact[layer])
+        extra_fit_rows.append(
+            {
+                "model": weights.model_name,
+                "transport_kind": "compact_angle_calibration",
+                "anchor_layer": anchor,
+                "source_layer": layer,
+                "ridge_multiplier": ridge,
+                "real_compact_angle_norm": real_norm,
+                "bootstrap_change_median": float(np.median(boot)) if len(boot) else math.nan,
+                "bootstrap_change_robust_scale": (
+                    float(1.4826 * np.median(np.abs(boot - np.median(boot))))
+                    if len(boot)
+                    else math.nan
+                ),
+                "partition_change_median": float(np.median(part)) if len(part) else math.nan,
+                "token_permuted_compact_norm_median": float(np.median(perm)) if len(perm) else math.nan,
+                "exceeds_bootstrap_floor": bool(
+                    len(boot) and real_norm > float(np.median(boot))
+                ),
+            }
+        )
+
+    # Outlier-coordinate arm: gpt2-style massive stream coordinates dominate
+    # the covariance and the condition number; refit with them projected out.
+    anchor_rms = torch.sqrt((matrices[anchor] ** 2).mean(dim=1))
+    outlier_coordinates = torch.argsort(anchor_rms, descending=True)[:2]
+    deleted = {
+        layer: matrix.clone() for layer, matrix in matrices.items()
+    }
+    for matrix in deleted.values():
+        matrix[outlier_coordinates] = 0.0
+    for layer in layers:
+        _, diagnostics = _fit_polar_on_indices(
+            deleted, anchor, layer, train_idx, eval_idx, ridge, device
+        )
+        extra_fit_rows.append(
+            {
+                "model": weights.model_name,
+                "transport_kind": "outlier_deleted_fit",
+                "anchor_layer": anchor,
+                "source_layer": layer,
+                "ridge_multiplier": ridge,
+                "outlier_coordinates": [int(index) for index in outlier_coordinates],
+                **diagnostics,
+            }
+        )
+
     ot_arrays, ot_rows = weight_ot_transports(weights, anchor, config.ridge_grid[1])
     transports.update(ot_arrays)
-    fit = pd.concat([fit, pd.DataFrame(ot_rows).assign(model=weights.model_name)], ignore_index=True, sort=False)
+    fit = pd.concat(
+        [fit, pd.DataFrame(ot_rows).assign(model=weights.model_name), pd.DataFrame(extra_fit_rows)],
+        ignore_index=True,
+        sort=False,
+    )
+    profiles = pd.concat(profile_frames, ignore_index=True, sort=False)
+    fitted_profiles = profiles[profiles["transport_control"] == "fitted"]
     primary_fit = fit[
         (fit["anchor_layer"] == anchor)
         & (fit["ridge_multiplier"] == ridge)
+        & fit.get("transport_kind").isna()
         & fit["heldout_r2_polar"].notna()
     ]
+    fitted_collapse = float(
+        fitted_profiles.groupby("edge_class")["collapse_fraction"].first().median()
+    )
+    permuted_floor = float(np.median(permuted_collapses)) if permuted_collapses else math.nan
     observations = [
         f"Activation-derived polar transports generalized with median held-out R2 {float(primary_fit['heldout_r2_polar'].median()):.3f} at the middle anchor.",
-        f"Transport changed between-span coupling-center variance by a median collapse fraction {float(profiles.groupby('edge_class')['collapse_fraction'].first().median()):.3f}; negative values are retained as findings.",
-        f"Pooled versus span-stratified selected-edge overlap changed from {float(profiles['raw_pooled_vs_stratified_selection_jaccard'].iloc[0]):.3f} to {float(profiles['covariant_pooled_vs_stratified_selection_jaccard'].iloc[0]):.3f} after transport.",
+        f"Fitted transport collapsed span-center variance by median fraction {fitted_collapse:.3f} against a token-permuted fit-anything floor of {permuted_floor:.3f}; the identity control returned collapse {identity_collapse:.2e} and covariant-coupling residual {identity_residual:.2e}.",
+        f"Pooled versus span-stratified selected-edge overlap changed from {float(fitted_profiles['raw_pooled_vs_stratified_selection_jaccard'].iloc[0]):.3f} to {float(fitted_profiles['covariant_pooled_vs_stratified_selection_jaccard'].iloc[0]):.3f} after transport.",
     ]
     return LayerTransportResult(
         transports=transports,
@@ -321,3 +515,4 @@ def run_layer_transport(
         covariant_edges=covariant,
         observations=observations,
     )
+

@@ -1,0 +1,61 @@
+{
+  "models": [
+    "EleutherAI/pythia-70m"
+  ],
+  "experiments": [
+    "all"
+  ],
+  "output": "R:\\albert-engine\\outputs\\debug_run2",
+  "device": "cuda",
+  "seed": 0,
+  "offline": true,
+  "inference_dtype": "float32",
+  "n_sequences": 4,
+  "induction_block": 32,
+  "natural_length": 64,
+  "position_length": 64,
+  "batch_size": 2,
+  "transport_train_fraction": 0.75,
+  "fdr_q": 0.05,
+  "support_rtol": 1e-09,
+  "ridge_grid": [
+    1e-09,
+    1e-07,
+    1e-05
+  ],
+  "transport_ridge_grid": [
+    1e-06,
+    0.0001,
+    0.01
+  ],
+  "dense_crosscheck_edges": 4,
+  "max_operator_edges_per_channel": 16,
+  "max_triangles_per_model": 6,
+  "max_synergy_triangles_per_model": 2,
+  "max_realized_edges_per_model": 3,
+  "max_mixed_edges_per_class": 250,
+  "max_neuron_wires": 2000,
+  "neuron_hist_bins": 501,
+  "surrogate_draws": 4,
+  "triangle_surrogate_draws": 2,
+  "max_surrogate_triangles_per_draw": 4,
+  "max_matched_control_triangles": 6,
+  "transport_control_draws": 2,
+  "bootstrap_draws": 4,
+  "lie_ambient_dims": [
+    8,
+    12,
+    16,
+    20,
+    26
+  ],
+  "lie_generator_dims": [
+    3,
+    6,
+    8,
+    10,
+    15
+  ],
+  "candidate_carrier": null,
+  "source_spec": "C:\\Users\\johnz\\Downloads\\transformer_communication_transport_experiment(3).md + C:\\Users\\johnz\\Downloads\\message_to_agent.md"
+}

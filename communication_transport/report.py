@@ -82,6 +82,8 @@ def _operator_figure(census: pd.DataFrame, path: Path) -> None:
 
 def _transport_figure(profiles: pd.DataFrame, path: Path) -> None:
     fig, axes = plt.subplots(1, 2, figsize=(10.5, 4.2), constrained_layout=True, sharey=False)
+    if len(profiles) and "transport_control" in profiles:
+        profiles = profiles[profiles["transport_control"] == "fitted"]
     if len(profiles):
         for channel, color in COLORS.items():
             group = profiles[profiles.get("edge_class", "") == f"head_head_{channel}"]
@@ -127,6 +129,17 @@ def _lie_figure(lie: pd.DataFrame, path: Path) -> None:
             saturated_count += int(saturated.sum())
             visible = group[~saturated]
             ax.scatter(visible["generator_dimension"], visible["closure_defect"], alpha=0.55, s=25, label=str(model))
+    baseline = lie[lie.get("row_kind", "") == "random_plane_baseline"] if len(lie) else lie
+    if len(baseline):
+        compact = baseline.drop_duplicates(["ambient_dimension", "generator_dimension"])
+        ax.scatter(
+            compact["generator_dimension"],
+            compact["baseline_median"],
+            marker="x",
+            s=34,
+            color="#333333",
+            label="matched random k-plane",
+        )
     ax.set_yscale("log")
     ax.set(xlabel="generator-span dimension", ylabel="closure defect", title="Nonsaturated carrier-agnostic Lie closure census")
     if saturated_count:
@@ -283,6 +296,109 @@ def _observations(output: Path) -> dict[str, str]:
     }
 
 
+def _anchors_lines(output: Path) -> list[str]:
+    """Wang's published GPT-2 reference numbers against this run's values.
+
+    An automatic anchors table at run time is the guard that catches a wrong
+    behavioral identification immediately.
+    """
+
+    edges = _read(output / "edges.parquet")
+    families = _read(output / "map_families.parquet")
+    communities = _read(output / "communities.parquet")
+    interventions = _read(output / "interventions.parquet")
+    gpt2_edges = edges[edges.get("model", "") == "gpt2"] if len(edges) else edges
+    if not len(gpt2_edges):
+        return [
+            "## External anchors (gpt2)",
+            "",
+            "No gpt2 rows are present in this run, so the published-anchor comparison is not constructible.",
+            "",
+        ]
+    head = gpt2_edges[gpt2_edges["edge_class"].astype(str).str.startswith("head_head_")]
+    selected = int(head.get("selected", pd.Series(dtype=bool)).fillna(False).sum())
+    k_rows = head[head["channel"] == "K"]
+    above = float((pd.to_numeric(k_rows["theoretical_z"], errors="coerce") >= 2).mean())
+    below = float((pd.to_numeric(k_rows["theoretical_z"], errors="coerce") <= -2).mean())
+
+    induction_heads: list[str] = []
+    summary_path = output / "model_summary.json"
+    if summary_path.exists():
+        for entry in json.loads(summary_path.read_text(encoding="utf-8")):
+            if entry.get("model") == "gpt2":
+                induction_heads = list(entry.get("induction_heads", []))
+    same_community = math.nan
+    if induction_heads and len(communities):
+        gpt2_com = communities[communities.get("model", "") == "gpt2"]
+        membership = dict(zip(gpt2_com.get("head", []), gpt2_com.get("community", [])))
+        labels = [membership.get(label, -1) for label in induction_heads]
+        if labels:
+            same_community = max(labels.count(value) for value in set(labels))
+    top_writer = "unavailable"
+    if induction_heads:
+        incoming = gpt2_edges[
+            (gpt2_edges["edge_class"] == "head_head_K")
+            & gpt2_edges["reader"].isin(induction_heads)
+        ]
+        if len(incoming):
+            top_writer = str(incoming.nlargest(1, "C")["writer"].iloc[0])
+    gpt2_iv = interventions[interventions.get("model", "") == "gpt2"] if len(interventions) else interventions
+
+    def intervention_fraction(kind: str, target: str) -> float:
+        rows = gpt2_iv[
+            (gpt2_iv.get("intervention", "") == kind)
+            & (gpt2_iv.get("target", "") == target)
+        ] if len(gpt2_iv) else gpt2_iv
+        return float(rows["fraction_gain_destroyed"].iloc[0]) if len(rows) else math.nan
+
+    community_ablation = intervention_fraction("mean_ablation", "induction_community")
+    posratio_deletion = intervention_fraction("plane_deletion", "posratio_plane")
+
+    outliers = "unavailable"
+    npz_path = output / "rw_pca_projectors.npz"
+    if npz_path.exists():
+        with np.load(npz_path) as arrays:
+            key = "gpt2__plane__outlier_coordinate_plane"
+            if key in arrays.files:
+                plane = arrays[key]
+                outliers = str(
+                    [int(np.argmax(np.abs(plane[:, index]))) for index in range(plane.shape[1])]
+                )
+    wire_rows = families[
+        (families.get("model", "") == "gpt2")
+        & (families.get("edge_class", "") == "neuron_neuron")
+    ] if len(families) else families
+    wire_excess = (
+        float(pd.to_numeric(wire_rows["observed_abs_cos_ge_0_2"], errors="coerce").sum())
+        if len(wire_rows)
+        else math.nan
+    )
+    wire_expected = (
+        float(pd.to_numeric(wire_rows["beta_expected_abs_cos_ge_0_2"], errors="coerce").sum())
+        if len(wire_rows)
+        else math.nan
+    )
+    rows = [
+        ("Selected head-head edges at FDR q=0.05", f"{selected}", "~1,051"),
+        ("K-composition above / below chance at |z|>=2", f"{above:.1%} / {below:.1%}", "~55% / ~34%"),
+        ("Behavioral induction heads sharing one community", f"{int(same_community) if math.isfinite(same_community) else 'unavailable'} of {len(induction_heads)}", "5 of 5 (L5H1, L5H5, L6H9, L7H2, L7H10)"),
+        ("Top K-composition writer into those heads", top_writer, "L4H11"),
+        ("Induction-community mean-ablation, gain destroyed", _fmt(community_ablation), "~0.938"),
+        ("PosRatio-plane deletion, gain destroyed", _fmt(posratio_deletion), "~0.923"),
+        ("Outlier stream coordinates", outliers, "[447, 138]"),
+        ("Neuron wires beyond |cos|=0.2 (vs exact Beta expectation)", f"{wire_excess:,.0f} (Beta {wire_expected:,.1f})", "~1e5 (Beta ~1e1)"),
+    ]
+    lines = [
+        "## External anchors (gpt2)",
+        "",
+        "| Quantity | This run | Wang reference |",
+        "|---|---|---|",
+    ]
+    lines.extend(f"| {name} | {value} | {reference} |" for name, value, reference in rows)
+    lines.append("")
+    return lines
+
+
 def render_report(output: Path) -> Path:
     observations = _observations(output)
     errors = []
@@ -304,6 +420,7 @@ def render_report(output: Path) -> Path:
         "This report was generated from the saved arrays and tables in this run directory.",
         "",
     ]
+    lines.extend(_anchors_lines(output))
     for index, (title, description) in enumerate(sections):
         key = chr(ord("A") + index)
         lines.extend([f"## {title}", "", description, "", "Observed:", "", observations[key], ""])

@@ -165,6 +165,113 @@ def _projected_jacobi_residual(ad: np.ndarray) -> float:
     return math.sqrt(numerator / max(denominator, 1.0e-300))
 
 
+def closure_defects_nested(full_basis: np.ndarray, ks: list[int]) -> dict[int, float]:
+    """Closure defect of the leading-k spans for every requested k.
+
+    ``full_basis`` comes from ``orthonormalize_generators`` (or an explicit
+    orthonormal construction), so its vectorized rows are orthonormal and the
+    leading-k rows span the same nested planes the single-k routine would use.
+    Brackets are computed once for the largest span and reused.
+    """
+
+    K = len(full_basis)
+    requested = sorted({k for k in ks if 2 <= k <= K})
+    out = {k: math.nan for k in ks}
+    if not requested:
+        return out
+    vectors = np.stack([skew_vector(item) for item in full_basis[: max(requested)]])
+    pair_index = [
+        (a, b)
+        for a in range(max(requested))
+        for b in range(a + 1, max(requested))
+    ]
+    bracket_vectors = np.stack(
+        [
+            skew_vector(
+                full_basis[a] @ full_basis[b] - full_basis[b] @ full_basis[a]
+            )
+            for a, b in pair_index
+        ]
+    )
+    for k in requested:
+        rows = [index for index, (_, b) in enumerate(pair_index) if b < k]
+        W = vectors[:k]
+        B = bracket_vectors[rows]
+        projected = (B @ W.T) @ W
+        denominator = float((B**2).sum())
+        out[k] = (
+            float(((B - projected) ** 2).sum()) / denominator
+            if denominator > 1.0e-24
+            else math.nan
+        )
+    return out
+
+
+def random_skew_plane(m: int, k: int, rng: np.random.Generator) -> np.ndarray:
+    """A Haar-uniform k-plane of skew matrices in so(m), orthonormal rows."""
+
+    total = m * (m - 1) // 2
+    Q = np.linalg.qr(rng.standard_normal((total, min(k, total))))[0]
+    return np.stack([vector_skew(Q[:, index], m) for index in range(Q.shape[1])])
+
+
+def _spectrum_preserving_ov(
+    weights: ModelWeights, labels: list[str], rng: np.random.Generator
+) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
+    """Per-head OV factors with random stream frames and preserved spectra."""
+
+    surrogate: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+    for label in labels:
+        layer, head = parse_head(label)
+        O, V = weights.O[layer, head], weights.V[layer, head]
+        _, Ro = torch.linalg.qr(O, mode="reduced")
+        _, Rv = torch.linalg.qr(V, mode="reduced")
+        singular = torch.linalg.svdvals(Ro @ Rv.T)
+        root = torch.sqrt(singular.clamp_min(0.0))
+        d, r = O.shape
+        left = torch.linalg.qr(
+            torch.tensor(rng.standard_normal((d, r)), dtype=torch.float64),
+            mode="reduced",
+        ).Q
+        right = torch.linalg.qr(
+            torch.tensor(rng.standard_normal((d, r)), dtype=torch.float64),
+            mode="reduced",
+        ).Q
+        surrogate[label] = (left * root, right * root)
+    return surrogate
+
+
+def _sign_randomized_ov(
+    weights: ModelWeights, labels: list[str], rng: np.random.Generator
+) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
+    surrogate: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+    for label in labels:
+        layer, head = parse_head(label)
+        sign = float(rng.choice((-1.0, 1.0)))
+        surrogate[label] = (weights.O[layer, head] * sign, weights.V[layer, head])
+    return surrogate
+
+
+def _permuted_within_layers(
+    weights: ModelWeights, labels: list[str], rng: np.random.Generator
+) -> list[str]:
+    permutations = {
+        layer: rng.permutation(weights.n_heads)
+        for layer in {parse_head(label)[0] for label in labels}
+    }
+    return [
+        weights.head_label(layer, int(permutations[layer][head]))
+        for layer, head in (parse_head(label) for label in labels)
+    ]
+
+
+def _column_shuffled(matrix: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+    out = matrix.copy()
+    for column in range(out.shape[1]):
+        rng.shuffle(out[:, column])
+    return out
+
+
 def so_basis(dimension: int, ambient: int | None = None, offset: int = 0) -> np.ndarray:
     ambient = ambient or dimension
     generators = []
@@ -343,21 +450,48 @@ def fit_candidate_conjugation(
     return min(results), results
 
 
+def _head_factors(
+    weights: ModelWeights,
+    label: str,
+    factor_overrides: dict[str, tuple[torch.Tensor, torch.Tensor]] | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if factor_overrides is not None and label in factor_overrides:
+        return factor_overrides[label]
+    layer, head = parse_head(label)
+    return weights.O[layer, head], weights.V[layer, head]
+
+
+def _ambient_source_svd(
+    weights: ModelWeights,
+    head_labels: list[str],
+    extra_subspaces: list[np.ndarray],
+    factor_overrides: dict[str, tuple[torch.Tensor, torch.Tensor]] | None = None,
+) -> np.ndarray:
+    """Left singular basis of the concatenated ambient source, computed once.
+
+    Slicing its leading columns reproduces ``_ambient_basis`` at every
+    requested dimension without repeating the SVD.
+    """
+
+    columns = []
+    for label in head_labels:
+        O, V = _head_factors(weights, label, factor_overrides)
+        columns.extend((O.numpy(), V.numpy()))
+    columns.extend(value for value in extra_subspaces if value.size)
+    if not columns:
+        return np.eye(weights.d_model)
+    source = np.concatenate(columns, axis=1)
+    U, _, _ = np.linalg.svd(source, full_matrices=False)
+    return U
+
+
 def _ambient_basis(
     weights: ModelWeights,
     head_labels: list[str],
     extra_subspaces: list[np.ndarray],
     dimension: int,
 ) -> np.ndarray:
-    columns = []
-    for label in head_labels:
-        layer, head = parse_head(label)
-        columns.extend((weights.O[layer, head].numpy(), weights.V[layer, head].numpy()))
-    columns.extend(value for value in extra_subspaces if value.size)
-    if not columns:
-        return np.eye(weights.d_model, min(dimension, weights.d_model))
-    source = np.concatenate(columns, axis=1)
-    U, _, _ = np.linalg.svd(source, full_matrices=False)
+    U = _ambient_source_svd(weights, head_labels, extra_subspaces)
     return U[:, : min(dimension, U.shape[1])]
 
 
@@ -365,16 +499,30 @@ def _projected_head_generators(
     weights: ModelWeights,
     labels: list[str],
     ambient_basis: np.ndarray,
+    factor_overrides: dict[str, tuple[torch.Tensor, torch.Tensor]] | None = None,
 ) -> list[np.ndarray]:
     U = torch.from_numpy(ambient_basis).double()
     generators = []
     for label in labels:
-        layer, head = parse_head(label)
-        projected = (U.T @ weights.O[layer, head]) @ (weights.V[layer, head].T @ U)
+        O, V = _head_factors(weights, label, factor_overrides)
+        projected = (U.T @ O) @ (V.T @ U)
         skew = 0.5 * (projected - projected.T)
         if float(torch.linalg.matrix_norm(skew)) > 1.0e-12:
             generators.append(skew.numpy())
     return generators
+
+
+def _activation_subspace(
+    activation_centered: np.ndarray, seed: int, rank: int = 26
+) -> np.ndarray:
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    tensor = torch.from_numpy(activation_centered).float().to(device)
+    requested = min(rank, tensor.shape[0], tensor.shape[1])
+    torch.manual_seed(seed)
+    _, _, vectors = torch.pca_lowrank(tensor, q=requested, center=False, niter=4)
+    out = vectors.double().cpu().numpy()
+    del tensor, vectors
+    return out
 
 
 def _choose_generator_dimensions(singular: np.ndarray, config: RunConfig) -> list[int]:
@@ -449,18 +597,7 @@ def run_lie_identification(
         for head in range(weights.n_heads)
     ][: min(weights.n_heads, 8)]
     activation_centered = activation_matrix - activation_matrix.mean(axis=0, keepdims=True)
-    activation_device = "cuda" if torch.cuda.is_available() else "cpu"
-    activation_tensor = torch.from_numpy(activation_centered).float().to(activation_device)
-    requested_rank = min(26, activation_tensor.shape[0], activation_tensor.shape[1])
-    torch.manual_seed(config.seed + 905)
-    _, _, activation_vectors = torch.pca_lowrank(
-        activation_tensor,
-        q=requested_rank,
-        center=False,
-        niter=4,
-    )
-    activation_subspace = activation_vectors.double().cpu().numpy()
-    del activation_tensor, activation_vectors
+    activation_subspace = _activation_subspace(activation_centered, config.seed + 905)
     extras = [joined_positional_support, activation_subspace]
     rows: list[dict[str, object]] = []
     learned_cache: dict[tuple[int, int], np.ndarray] = {}
@@ -506,65 +643,146 @@ def run_lie_identification(
                     }
                 )
 
-    # Full-pipeline layer-matched surrogates: refit ambient basis, generator
-    # SVD, data-driven k, closure, and standard candidate distances each draw.
+    # Full-pipeline surrogate refits at EVERY learned stratum, for the five
+    # surrogate families of the shared protocol, plus a matched random-plane
+    # baseline per stratum.  Each draw refits the ambient basis, the generator
+    # SVD, and the data-driven generator count, exactly as the learned pass.
+    strata = sorted(learned_cache)
+    ks_by_m: dict[int, list[int]] = {}
+    for m, k in strata:
+        ks_by_m.setdefault(m, []).append(k)
+    learned_defect = {
+        (m, k): closure_defect(learned_cache[(m, k)])[0] for (m, k) in strata
+    }
     rng = np.random.default_rng(config.seed + 902)
-    reference_pairs = sorted(learned_cache)
-    if reference_pairs:
-        ref_m, ref_k = min(
-            reference_pairs,
-            key=lambda pair: abs(pair[0] - min(26, weights.d_model)) + abs(pair[1] - min(10, len(labels))),
+    extra_draws = max(24, config.surrogate_draws // 4)
+    families: tuple[tuple[str, int], ...] = (
+        ("layer_matched_random_community", config.surrogate_draws),
+        ("spectrum_preserving_rotation", extra_draws),
+        ("permuted_head_identities", extra_draws),
+        # Per-head OV sign flips leave the generator span identical, so this
+        # family is an analytic invariance check rather than a null.
+        ("sign_randomization", 8),
+        ("activation_shuffle", extra_draws),
+    )
+    family_values: dict[tuple[str, int, int], list[float]] = {}
+    for family, draws in families:
+        for draw in range(draws):
+            factor_overrides = None
+            draw_labels = labels
+            draw_extras = extras
+            if family == "layer_matched_random_community":
+                draw_labels = _layer_matched_random(weights, labels, rng)
+            elif family == "spectrum_preserving_rotation":
+                factor_overrides = _spectrum_preserving_ov(weights, labels, rng)
+            elif family == "permuted_head_identities":
+                draw_labels = _permuted_within_layers(weights, labels, rng)
+            elif family == "sign_randomization":
+                factor_overrides = _sign_randomized_ov(weights, labels, rng)
+            elif family == "activation_shuffle":
+                draw_extras = [
+                    joined_positional_support,
+                    _activation_subspace(
+                        _column_shuffled(activation_centered, rng),
+                        config.seed + 905,
+                    ),
+                ]
+            source = _ambient_source_svd(
+                weights, draw_labels, draw_extras, factor_overrides
+            )
+            for m in sorted(ks_by_m):
+                ambient = source[:, : min(m, source.shape[1])]
+                raw = _projected_head_generators(
+                    weights, draw_labels, ambient, factor_overrides
+                )
+                full, singular = orthonormalize_generators(raw)
+                numerical = int(
+                    np.count_nonzero(
+                        singular
+                        > 1.0e-8 * max(float(singular.max()) if len(singular) else 0.0, 1.0)
+                    )
+                )
+                chosen = {k: min(k, numerical) for k in ks_by_m[m]}
+                defects = closure_defects_nested(
+                    full, sorted({value for value in chosen.values() if value >= 2})
+                )
+                for k in ks_by_m[m]:
+                    chosen_k = chosen[k]
+                    if chosen_k < 2:
+                        continue
+                    defect = defects[chosen_k]
+                    family_values.setdefault((family, m, k), []).append(defect)
+                    rows.append(
+                        {
+                            "model": weights.model_name,
+                            "row_kind": "surrogate_refit",
+                            "surrogate_kind": family,
+                            "surrogate_draw": draw,
+                            "ambient_dimension": ambient.shape[1],
+                            "generator_dimension": chosen_k,
+                            "requested_generator_dimension": k,
+                            "surrogate_numerical_rank": numerical,
+                            "closure_defect": defect,
+                            "reference_closure_defect": learned_defect[(m, k)],
+                        }
+                    )
+    for (family, m, k), values in sorted(family_values.items()):
+        data = np.asarray([value for value in values if math.isfinite(value)])
+        if not len(data):
+            continue
+        center = float(np.median(data))
+        scale = max(1.4826 * float(np.median(np.abs(data - center))), 1.0e-12)
+        reference = learned_defect[(m, k)]
+        rows.append(
+            {
+                "model": weights.model_name,
+                "row_kind": "surrogate_summary",
+                "surrogate_kind": family,
+                "ambient_dimension": m,
+                "generator_dimension": k,
+                "closure_defect": reference,
+                "surrogate_median": center,
+                "surrogate_robust_scale": scale,
+                "surrogate_separation": (reference - center) / scale,
+                "surrogate_exceedance_count_lower": int(
+                    np.count_nonzero(data <= reference)
+                ),
+                "surrogate_draws": len(data),
+                "surrogate_max_abs_shift_from_reference": float(
+                    np.max(np.abs(data - reference))
+                ),
+            }
         )
-        reference = learned_cache[(ref_m, ref_k)]
-        reference_defect = closure_defect(reference)[0]
-        surrogate_defects = []
-        surrogate_candidate: dict[str, list[float]] = {
-            name: [] for name in candidate_menu(ref_m, ref_k)
-        }
-        for draw in range(config.surrogate_draws):
-            surrogate_labels = _layer_matched_random(weights, labels, rng)
-            ambient = _ambient_basis(weights, surrogate_labels, extras, ref_m)
-            raw = _projected_head_generators(weights, surrogate_labels, ambient)
-            full, singular = orthonormalize_generators(raw)
-            numerical = int(np.count_nonzero(singular > 1.0e-8 * max(float(singular.max()) if len(singular) else 0.0, 1.0)))
-            chosen_k = min(ref_k, numerical)
-            if chosen_k < 2:
-                continue
-            surrogate = full[:chosen_k]
-            defect = closure_defect(surrogate)[0]
-            surrogate_defects.append(defect)
-            if chosen_k == ref_k:
-                for name, candidate in candidate_menu(ref_m, ref_k).items():
-                    surrogate_candidate[name].append(projector_chordal(surrogate, candidate))
-            rows.append(
-                {
-                    "model": weights.model_name,
-                    "row_kind": "surrogate_refit",
-                    "surrogate_kind": "layer_count_matched_random_community",
-                    "surrogate_draw": draw,
-                    "ambient_dimension": ref_m,
-                    "generator_dimension": chosen_k,
-                    "closure_defect": defect,
-                    "reference_closure_defect": reference_defect,
-                }
-            )
-        if surrogate_defects:
-            center = float(np.median(surrogate_defects))
-            scale = max(1.4826 * float(np.median(np.abs(np.asarray(surrogate_defects) - center))), 1.0e-12)
-            rows.append(
-                {
-                    "model": weights.model_name,
-                    "row_kind": "surrogate_summary",
-                    "ambient_dimension": ref_m,
-                    "generator_dimension": ref_k,
-                    "closure_defect": reference_defect,
-                    "surrogate_median": center,
-                    "surrogate_robust_scale": scale,
-                    "surrogate_separation": (reference_defect - center) / scale,
-                    "surrogate_exceedance_count_lower": int(np.count_nonzero(np.asarray(surrogate_defects) <= reference_defect)),
-                    "surrogate_draws": len(surrogate_defects),
-                }
-            )
+    # Matched random-plane baseline: the codimension floor a k-plane in so(m)
+    # carries with no structure at all; excess closure = baseline - learned.
+    for m, k in strata:
+        total = m * (m - 1) // 2
+        plane_k = min(k, total)
+        if plane_k < 2:
+            continue
+        baseline = [
+            closure_defect(random_skew_plane(m, plane_k, rng))[0]
+            for _ in range(config.surrogate_draws)
+        ]
+        data = np.asarray([value for value in baseline if math.isfinite(value)])
+        if not len(data):
+            continue
+        center = float(np.median(data))
+        rows.append(
+            {
+                "model": weights.model_name,
+                "row_kind": "random_plane_baseline",
+                "ambient_dimension": m,
+                "generator_dimension": plane_k,
+                "closure_defect": learned_defect[(m, k)],
+                "baseline_median": center,
+                "baseline_robust_scale": max(
+                    1.4826 * float(np.median(np.abs(data - center))), 1.0e-12
+                ),
+                "baseline_draws": len(data),
+                "excess_closure": center - learned_defect[(m, k)],
+            }
+        )
 
     table = pd.DataFrame(rows)
     if len(table):
@@ -585,13 +803,23 @@ def run_lie_identification(
         conclusion = "The learned generator planes had no dimension-compatible candidate in the declared classical menu."
     else:
         conclusion = "The community generators were abelian, rank-deficient, or otherwise unavailable for Lie identification."
+    baseline_rows = table[table["row_kind"] == "random_plane_baseline"] if len(table) else table
+    excess_sentence = "No random-plane baseline stratum was constructible."
+    if len(baseline_rows):
+        headline = baseline_rows.loc[
+            pd.to_numeric(baseline_rows["ambient_dimension"]).isin([26, 52])
+        ]
+        headline = headline if len(headline) else baseline_rows
+        top = headline.loc[pd.to_numeric(headline["excess_closure"]).idxmax()]
+        excess_sentence = (
+            f"Against matched random k-planes the largest excess closure was {float(top['excess_closure']):.4f}"
+            f" at ambient {int(top['ambient_dimension'])}, generator dimension {int(top['generator_dimension'])}"
+            f" (learned {float(top['closure_defect']):.4f} vs baseline {float(top['baseline_median']):.4f}"
+            f" +- {float(top['baseline_robust_scale']):.4f}); closure is mostly codimension."
+        )
     observations = [
         f"Across nonsaturated generator spans, the smallest measured closure defect was {float(finite_closure.min()) if len(finite_closure) else math.nan:.6g}; saturated full-so(m) rows are labeled separately.",
-        (
-            f"A saturated full-so(m) span closed at defect {float(saturated_closure.min()):.3g}, as it must."
-            if len(saturated_closure)
-            else "No learned span saturated its entire ambient orthogonal algebra."
-        ),
+        excess_sentence,
         conclusion,
         "Exact dimension-52 classical impostors and the marked compact F4 control all closed numerically; dimension and closure alone therefore did not identify F4.",
     ]

@@ -54,18 +54,27 @@ class RunConfig:
     transport_ridge_grid: tuple[float, ...] = (1.0e-6, 1.0e-4, 1.0e-2)
     dense_crosscheck_edges: int = 12
     max_operator_edges_per_channel: int = 96
-    max_triangles_per_model: int = 24
-    max_synergy_triangles_per_model: int = 8
+    max_triangles_per_model: int = 200
+    max_synergy_triangles_per_model: int = 150
     max_realized_edges_per_model: int = 12
     max_mixed_edges_per_class: int = 5_000
     max_neuron_wires: int = 100_000
     neuron_hist_bins: int = 2001
-    surrogate_draws: int = 24
+    surrogate_draws: int = 100
+    # The full-pipeline triangle surrogate rebuilds the map per draw, so it
+    # carries its own budget.
+    triangle_surrogate_draws: int = 12
+    max_surrogate_triangles_per_draw: int = 48
+    max_matched_control_triangles: int = 200
+    transport_control_draws: int = 3
     bootstrap_draws: int = 24
     lie_ambient_dims: tuple[int, ...] = (8, 12, 16, 20, 24, 26, 32, 40, 52)
     lie_generator_dims: tuple[int, ...] = (3, 6, 8, 10, 15, 21, 24, 28, 36, 52)
     candidate_carrier: Path | None = None
-    source_spec: str = "transformer_communication_transport_experiment(2).md"
+    source_spec: str = (
+        r"C:\Users\johnz\Downloads\transformer_communication_transport_experiment(3).md"
+        r" + C:\Users\johnz\Downloads\message_to_agent.md"
+    )
 
     @classmethod
     def debug(
@@ -95,6 +104,10 @@ class RunConfig:
             max_neuron_wires=2_000,
             neuron_hist_bins=501,
             surrogate_draws=4,
+            triangle_surrogate_draws=2,
+            max_surrogate_triangles_per_draw=4,
+            max_matched_control_triangles=6,
+            transport_control_draws=2,
             bootstrap_draws=4,
             lie_ambient_dims=(8, 12, 16, 20, 26),
             lie_generator_dims=(3, 6, 8, 10, 15),
@@ -125,3 +138,4 @@ class RunConfig:
 
 def slugify_model(name: str) -> str:
     return name.split("/")[-1].replace("_", "-").lower()
+

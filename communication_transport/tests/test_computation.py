@@ -220,6 +220,104 @@ def test_exact_lie_control_closes_and_candidate_fit_recovers() -> None:
     assert starts
 
 
+def test_random_plane_closure_matches_codimension_reference() -> None:
+    from communication_transport.lie_identification import (
+        closure_defects_nested,
+        random_skew_plane,
+    )
+
+    rng = np.random.default_rng(11)
+    values = []
+    for _ in range(6):
+        plane = random_skew_plane(8, 24, rng)
+        defect, _, _ = closure_defect(plane)
+        values.append(defect)
+        nested = closure_defects_nested(plane, [24])
+        observed_close("nested vs direct closure", nested[24], defect, 1.0e-12)
+    mean = float(np.mean(values))
+    # Independent review reference 0.154 +- 0.005 at (m=8, k=24).
+    print(f"Observed: random 24-plane in so(8) closure defect mean={mean:.4f}")
+    assert abs(mean - 0.154) < 0.02
+
+
+def test_stream_frame_randomization_preserves_grams_and_spectra(
+    tiny_weights: ModelWeights,
+) -> None:
+    from communication_transport.graph_connection import _stream_frame_randomized
+
+    rng = np.random.default_rng(23)
+    surrogate = _stream_frame_randomized(tiny_weights, rng)
+    for stack, original in (
+        (surrogate.Q, tiny_weights.Q),
+        (surrogate.O, tiny_weights.O),
+    ):
+        for layer in range(tiny_weights.n_layers):
+            for head in range(tiny_weights.n_heads):
+                observed_close(
+                    "surrogate inner Gram",
+                    (stack[layer, head].T @ stack[layer, head]).numpy(),
+                    (original[layer, head].T @ original[layer, head]).numpy(),
+                    1.0e-10,
+                )
+    changed = float(
+        torch.linalg.matrix_norm(surrogate.O[0, 0] - tiny_weights.O[0, 0])
+    )
+    print(f"Observed: surrogate stream frame moved by {changed:.3f}")
+    assert changed > 1.0e-3
+
+
+def test_aggregate_thomas_wigner_pair_law_and_support(
+    tiny_weights: ModelWeights,
+) -> None:
+    from communication_transport.operator_core import run_thomas_wigner_aggregate
+
+    edges = add_empirical_selection(compute_head_edges(tiny_weights), 0.05)
+    communities = pd.DataFrame(
+        {
+            "model": ["tiny"] * 4,
+            "head": ["L0H0", "L0H1", "L1H0", "L1H1"],
+            "community": [0, 0, 0, 0],
+            "is_induction_community": [True] * 4,
+        }
+    )
+    config = RunConfig.debug(output="unused_tmp")
+    frame = run_thomas_wigner_aggregate(tiny_weights, edges, communities, config)
+    valid = frame[frame.get("local_error", pd.Series(index=frame.index, dtype=object)).isna()]
+    assert len(valid)
+    residual = float(valid["pair_formula_residual"].max())
+    oddness = float(valid["forward_reverse_oddness_residual"].max())
+    intersection = float(valid["intersection_support_dimension"].min())
+    print(
+        f"Observed: aggregate TW pair residual={residual:.3e}, oddness={oddness:.3e}, min intersection={intersection:.0f}"
+    )
+    assert residual < 1.0e-9
+    assert oddness < 1.0e-9
+    assert intersection >= 2
+
+
+def test_neox_rope_matrix_pairs_split_halves(tiny_weights: ModelWeights) -> None:
+    import dataclasses
+
+    rotary = dataclasses.replace(
+        tiny_weights,
+        d_head=8,
+        rotary_dim=4,
+        positional_scheme="rotary",
+        rotary_adjacent_pairs=False,
+    )
+    R = rope_matrix(rotary, 5)
+    half = rotary.rotary_dim // 2
+    # Split-half pairing mixes (0, half) and leaves (0, 1) unmixed.
+    assert abs(R[0, half]) > 1.0e-6
+    assert abs(R[0, 1]) < 1.0e-12
+    observed_close(
+        "NeoX rope additivity",
+        rope_matrix(rotary, 3) @ rope_matrix(rotary, 4),
+        rope_matrix(rotary, 7),
+        1.0e-12,
+    )
+
+
 def test_synthetic_ternary_positive_control_detects_increment() -> None:
     frame = pd.DataFrame(_synthetic_control(3))
     pair = float(frame.loc[frame["feature_set"] == "pairwise", "held_out_r2"].iloc[0])

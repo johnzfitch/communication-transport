@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import itertools
 import math
 from dataclasses import dataclass
@@ -8,7 +9,6 @@ import networkx as nx
 import numpy as np
 import pandas as pd
 import torch
-from scipy import linalg as spla
 
 from .config import RunConfig
 from .model_io import parse_head
@@ -138,8 +138,11 @@ def _angle_from_orthogonal(matrix: np.ndarray) -> tuple[float, float, bool]:
     dominant = float(angles[np.argmax(np.abs(angles))]) if len(angles) else 0.0
     if near_cut:
         return dominant, math.nan, True
-    logarithm = np.real_if_close(spla.logm(matrix), tol=1_000).real
-    oriented = float(np.linalg.norm(0.5 * (logarithm - logarithm.T)))
+    # The principal log of an orthogonal matrix is skew with singular values
+    # equal to the rotation angles, so ||skew log H||_F^2 = sum_j theta_j^2
+    # over all complex eigenvalues; rank-deficient partial polars contribute
+    # zero angles on their null space.
+    oriented = float(math.sqrt(float(np.sum(angles**2))))
     return dominant, oriented, False
 
 
@@ -183,8 +186,10 @@ def _triangle_statistics(
     dominant_angle, oriented_norm, branch_cut = _angle_from_orthogonal(H.numpy())
     reversed_product = A_jk @ A_ij
     order_difference = float(torch.linalg.matrix_norm(A_cmp - reversed_product)) / max(norm_cmp, 1.0e-300)
+    support_dimension = int(basis.shape[1])
     return {
         "model": weights.model_name,
+        "triple_id": f"{k}>{j}>{i}",
         "k": k,
         "j": j,
         "i": i,
@@ -195,28 +200,31 @@ def _triangle_statistics(
         "radial_residual": radial,
         "positive_endpoint_distance": positive_distance,
         "compact_holonomy_score": compact_score,
+        "compact_holonomy_per_support_dim": compact_score / max(support_dimension, 1),
         "compact_log_norm": oriented_norm,
         "dominant_oriented_angle": dominant_angle,
         "order_reversal_difference": order_difference,
         "path_residual_over_direct": residual / max(norm_dir, 1.0e-300),
         "path_residual_over_composed": residual / max(norm_cmp, 1.0e-300),
         "path_residual_symmetric": residual / max(norm_dir + norm_cmp, 1.0e-300),
-        "support_dimension": len(basis),
+        "support_dimension": support_dimension,
         "ridge_value": ridge,
         "polar_method": method,
         "near_minus_one_branch_cut": branch_cut,
     }
 
 
-def enumerate_triangles(
-    weights: ModelWeights,
-    edges: pd.DataFrame,
-    communities: pd.DataFrame,
-    config: RunConfig,
-) -> list[tuple[str, str, str]]:
-    v_edges = edges[
-        (edges["edge_class"] == "head_head_V") & edges["selected"]
-    ]
+def _span_pattern(triple: tuple[str, str, str]) -> tuple[int, int]:
+    lk, lj, li = (parse_head(label)[0] for label in triple)
+    return (lj - lk, li - lj)
+
+
+def triangle_candidates(
+    edges: pd.DataFrame, communities: pd.DataFrame
+) -> dict[tuple[str, str, str], dict[str, object]]:
+    """Every causal V triple with a direct edge, with its stratum labels."""
+
+    v_edges = edges[(edges["edge_class"] == "head_head_V") & edges["selected"]]
     outgoing: dict[str, set[str]] = {}
     for edge in v_edges.itertuples():
         outgoing.setdefault(edge.writer, set()).add(edge.reader)
@@ -224,19 +232,30 @@ def enumerate_triangles(
         (edge.writer, edge.reader): edge
         for edge in edges[edges["edge_class"] == "head_head_V"].itertuples()
     }
-    candidates: list[tuple[float, tuple[str, str, str]]] = []
+    induction = dict(zip(communities["head"], communities["is_induction_community"]))
+    candidates: dict[tuple[str, str, str], dict[str, object]] = {}
+
+    def register(k: str, j: str, i: str) -> None:
+        direct = direct_lookup.get((k, i))
+        first = direct_lookup.get((k, j))
+        second = direct_lookup.get((j, i))
+        if direct is None or first is None or second is None:
+            return
+        triple = (k, j, i)
+        if triple in candidates or len({k, j, i}) != 3:
+            return
+        candidates[triple] = {
+            "min_C": min(float(direct.C), float(first.C), float(second.C)),
+            "span_pattern": _span_pattern(triple),
+            "inside_induction_community": all(
+                induction.get(label, False) for label in triple
+            ),
+        }
+
     for k, middle_set in outgoing.items():
         for j in middle_set:
             for i in outgoing.get(j, set()):
-                direct = direct_lookup.get((k, i))
-                if direct is None:
-                    continue
-                score = min(
-                    float(direct.C),
-                    float(direct_lookup[(k, j)].C),
-                    float(direct_lookup[(j, i)].C),
-                )
-                candidates.append((score, (k, j, i)))
+                register(k, j, i)
     if not candidates:
         # The selected graph can be triangle-free in very small models.  Use
         # top V edges for the two causal steps and retain the actual direct
@@ -250,17 +269,38 @@ def enumerate_triangles(
         for k, mids in top_out.items():
             for j in mids:
                 for i in top_out.get(j, []):
-                    direct = direct_lookup.get((k, i))
-                    if direct is not None:
-                        candidates.append((float(direct.C), (k, j, i)))
-    seen: set[tuple[str, str, str]] = set()
+                    register(k, j, i)
+    return candidates
+
+
+def enumerate_triangles(
+    weights: ModelWeights,
+    edges: pd.DataFrame,
+    communities: pd.DataFrame,
+    config: RunConfig,
+    cap: int | None = None,
+) -> list[tuple[str, str, str]]:
+    """Stratified triple census: round-robin over (community, span-pattern)
+    strata in descending coupling order, so no stratum monopolizes the cap."""
+
+    cap = cap or config.max_triangles_per_model
+    candidates = triangle_candidates(edges, communities)
+    strata: dict[tuple[bool, tuple[int, int]], list[tuple[float, tuple[str, str, str]]]] = {}
+    for triple, info in candidates.items():
+        key = (bool(info["inside_induction_community"]), info["span_pattern"])
+        strata.setdefault(key, []).append((float(info["min_C"]), triple))
+    for queue in strata.values():
+        queue.sort(reverse=True)
     ordered: list[tuple[str, str, str]] = []
-    for _, triple in sorted(candidates, reverse=True):
-        if triple not in seen:
-            ordered.append(triple)
-            seen.add(triple)
-        if len(ordered) >= config.max_triangles_per_model:
-            break
+    # Induction-community strata first inside each round so they are never
+    # starved by the (much larger) outside population.
+    keys = sorted(strata, key=lambda key: (not key[0], key[1]))
+    while len(ordered) < cap and any(strata[key] for key in keys):
+        for key in keys:
+            if strata[key]:
+                ordered.append(strata[key].pop(0)[1])
+                if len(ordered) >= cap:
+                    break
     return ordered
 
 
@@ -273,7 +313,8 @@ def run_triangles(
     membership = dict(zip(communities["head"], communities["community"]))
     induction = dict(zip(communities["head"], communities["is_induction_community"]))
     rows: list[dict[str, object]] = []
-    for triple in enumerate_triangles(weights, edges, communities, config):
+    analyzed = enumerate_triangles(weights, edges, communities, config)
+    for triple in analyzed:
         for method, ridges in (
             ("truncated_support", (config.ridge_grid[0],)),
             ("ridge", config.ridge_grid),
@@ -281,6 +322,7 @@ def run_triangles(
             for ridge in ridges:
                 try:
                     row = _triangle_statistics(weights, triple, ridge, method, config)
+                    row["row_kind"] = "v_triangle"
                     row["community_labels"] = [membership.get(head, -1) for head in triple]
                     row["inside_induction_community"] = all(induction.get(head, False) for head in triple)
                     row["matched_null_id"] = None
@@ -289,6 +331,7 @@ def run_triangles(
                     rows.append(
                         {
                             "model": weights.model_name,
+                            "row_kind": "v_triangle",
                             "k": triple[0],
                             "j": triple[1],
                             "i": triple[2],
@@ -297,7 +340,261 @@ def run_triangles(
                             "local_error": f"{type(exc).__name__}: {exc}",
                         }
                     )
+    rows.extend(
+        _matched_control_rows(weights, edges, communities, analyzed, config)
+    )
     return pd.DataFrame(rows)
+
+
+def _matched_control_rows(
+    weights: ModelWeights,
+    edges: pd.DataFrame,
+    communities: pd.DataFrame,
+    analyzed: list[tuple[str, str, str]],
+    config: RunConfig,
+) -> list[dict[str, object]]:
+    """Span-, channel-, and coupling-matched triangles outside the induction
+    community, one pool per analyzed inside-community triangle."""
+
+    candidates = triangle_candidates(edges, communities)
+    inside = [
+        triple
+        for triple in analyzed
+        if candidates.get(triple, {}).get("inside_induction_community")
+    ]
+    if not inside:
+        return []
+    analyzed_set = set(analyzed)
+    outside_pool = [
+        (triple, info)
+        for triple, info in candidates.items()
+        if not info["inside_induction_community"] and triple not in analyzed_set
+    ]
+    membership = dict(zip(communities["head"], communities["community"]))
+    used: set[tuple[str, str, str]] = set()
+    rows: list[dict[str, object]] = []
+    per_target = max(1, config.max_matched_control_triangles // max(len(inside), 1))
+    for target in inside:
+        target_info = candidates[target]
+        matches = sorted(
+            (
+                (abs(float(info["min_C"]) - float(target_info["min_C"])), triple)
+                for triple, info in outside_pool
+                if info["span_pattern"] == target_info["span_pattern"]
+                and triple not in used
+            ),
+        )[:per_target]
+        for _, triple in matches:
+            used.add(triple)
+            try:
+                row = _triangle_statistics(
+                    weights, triple, config.ridge_grid[0], "ridge", config
+                )
+                row["row_kind"] = "v_triangle_matched_control"
+                row["community_labels"] = [membership.get(head, -1) for head in triple]
+                row["inside_induction_community"] = False
+                row["matched_null_id"] = f"{target[0]}>{target[1]}>{target[2]}"
+                rows.append(row)
+            except Exception as exc:
+                rows.append(
+                    {
+                        "model": weights.model_name,
+                        "row_kind": "v_triangle_matched_control",
+                        "k": triple[0],
+                        "j": triple[1],
+                        "i": triple[2],
+                        "matched_null_id": f"{target[0]}>{target[1]}>{target[2]}",
+                        "local_error": f"{type(exc).__name__}: {exc}",
+                    }
+                )
+            if len(rows) >= config.max_matched_control_triangles:
+                return rows
+    return rows
+
+
+def _stream_frame_randomized(weights: ModelWeights, rng: np.random.Generator) -> ModelWeights:
+    """Rotate every head factor's residual-stream frame to a Haar-random one
+    while preserving its singular spectrum and its head-internal Gram."""
+
+    def randomized(stack: torch.Tensor) -> torch.Tensor:
+        out = torch.empty_like(stack)
+        layers, heads, d, r = stack.shape
+        for layer in range(layers):
+            for head in range(heads):
+                U, singular, Vh = torch.linalg.svd(stack[layer, head], full_matrices=False)
+                gaussian = torch.tensor(
+                    rng.standard_normal((d, r)), dtype=torch.float64
+                )
+                frame = torch.linalg.qr(gaussian, mode="reduced").Q
+                out[layer, head] = (frame * singular) @ Vh
+        return out
+
+    return dataclasses.replace(
+        weights,
+        Q=randomized(weights.Q),
+        K=randomized(weights.K),
+        V=randomized(weights.V),
+        O=randomized(weights.O),
+    )
+
+
+def run_triangle_surrogates(
+    weights: ModelWeights,
+    induction_heads: list[str],
+    config: RunConfig,
+) -> pd.DataFrame:
+    """Full-pipeline surrogate: randomize stream frames spectrum-preserving,
+    rebuild the map, refit nulls, reselect edges, rebuild communities, and
+    recompute the triangle statistics per draw."""
+
+    from .wang_map import add_empirical_selection, compute_head_edges
+
+    rows: list[dict[str, object]] = []
+    rng = np.random.default_rng(config.seed + 811)
+    for draw in range(config.triangle_surrogate_draws):
+        surrogate = _stream_frame_randomized(weights, rng)
+        edges = add_empirical_selection(compute_head_edges(surrogate), config.fdr_q)
+        communities, _, _ = build_communities(
+            surrogate, edges, induction_heads, config.seed + 811 + draw
+        )
+        triples = enumerate_triangles(
+            surrogate,
+            edges,
+            communities,
+            config,
+            cap=config.max_surrogate_triangles_per_draw,
+        )
+        induction = dict(
+            zip(communities["head"], communities["is_induction_community"])
+        )
+        for triple in triples:
+            try:
+                row = _triangle_statistics(
+                    surrogate, triple, config.ridge_grid[0], "ridge", config
+                )
+                row["row_kind"] = "v_triangle_surrogate"
+                row["surrogate_draw"] = draw
+                row["inside_induction_community"] = all(
+                    induction.get(head, False) for head in triple
+                )
+                rows.append(row)
+            except Exception as exc:
+                rows.append(
+                    {
+                        "model": weights.model_name,
+                        "row_kind": "v_triangle_surrogate",
+                        "surrogate_draw": draw,
+                        "k": triple[0],
+                        "j": triple[1],
+                        "i": triple[2],
+                        "local_error": f"{type(exc).__name__}: {exc}",
+                    }
+                )
+        del surrogate, edges, communities
+        import gc
+
+        gc.collect()
+    return pd.DataFrame(rows)
+
+
+_TRIANGLE_CLASS_STATS = (
+    ("compact_holonomy_per_support_dim", "compact"),
+    ("positive_endpoint_distance", "endpoint"),
+    ("path_residual_symmetric", "shape"),
+    ("radial_residual_abs", "radial"),
+    ("order_reversal_difference", "order"),
+)
+
+
+def triangle_surrogate_summary(
+    model_name: str, real: pd.DataFrame, surrogate: pd.DataFrame
+) -> tuple[list[dict[str, object]], str]:
+    """Real-versus-surrogate separations per statistic plus the design's
+    classification sentence, emitted from the comparison."""
+
+    def prepared(frame: pd.DataFrame) -> pd.DataFrame:
+        out = frame.copy()
+        if "radial_residual" in out:
+            out["radial_residual_abs"] = pd.to_numeric(
+                out["radial_residual"], errors="coerce"
+            ).abs()
+        return out
+
+    real = prepared(real)
+    surrogate = prepared(surrogate)
+    rows: list[dict[str, object]] = []
+    separations: dict[str, float] = {}
+    for column, label in _TRIANGLE_CLASS_STATS:
+        real_values = pd.to_numeric(real.get(column), errors="coerce").dropna()
+        if not len(real_values) or "surrogate_draw" not in surrogate:
+            continue
+        draw_medians = (
+            surrogate.assign(
+                value=pd.to_numeric(surrogate.get(column), errors="coerce")
+            )
+            .dropna(subset=["value"])
+            .groupby("surrogate_draw")["value"]
+            .median()
+        )
+        if not len(draw_medians):
+            continue
+        center = float(draw_medians.median())
+        scale = max(
+            1.4826 * float((draw_medians - center).abs().median()), 1.0e-12
+        )
+        real_median = float(real_values.median())
+        separation = (real_median - center) / scale
+        separations[label] = separation
+        rows.append(
+            {
+                "model": model_name,
+                "row_kind": "triangle_surrogate_summary",
+                "statistic": column,
+                "real_median": real_median,
+                "real_n": int(len(real_values)),
+                "surrogate_median_of_draw_medians": center,
+                "surrogate_robust_scale": scale,
+                "separation": separation,
+                "surrogate_draw_medians_below_real": int(
+                    (draw_medians <= real_median).sum()
+                ),
+                "surrogate_draws": int(len(draw_medians)),
+            }
+        )
+    below = sorted(label for label, value in separations.items() if value <= -2.0)
+    above = sorted(label for label, value in separations.items() if value >= 2.0)
+    if not separations:
+        sentence = "No real-versus-surrogate triangle comparison was constructible."
+    elif not below and not above:
+        sentence = (
+            "Against full-pipeline spectrum-preserving surrogates every triangle register was "
+            "indistinguishable from random stream frames: the communities behave as scalar "
+            "clusters at this instrument's resolution."
+        )
+    else:
+        parts = []
+        if below:
+            parts.append(
+                "below the surrogate distribution in " + ", ".join(below)
+            )
+        if above:
+            parts.append(
+                "above it in " + ", ".join(above)
+            )
+        residue = "compact" in below
+        endpoint = "endpoint" in below
+        if endpoint and not residue:
+            reading = "endpoint-compatible subbundle structure"
+        elif residue:
+            reading = "partial parallel transport with reduced compact residue"
+        else:
+            reading = "mixed residual structure"
+        sentence = (
+            "Real triangles sit "
+            + " and ".join(parts)
+            + f" (|separation| >= 2 robust sigma), consistent with {reading}; all other registers match the surrogate null."
+        )
+    return rows, sentence
 
 
 def _square_polar(matrix: torch.Tensor, rtol: float) -> torch.Tensor:
@@ -370,7 +667,8 @@ def run_role_loops(
     config: RunConfig,
 ) -> pd.DataFrame:
     base = triangles[
-        (triangles["polar_method"] == "ridge")
+        (triangles.get("row_kind", "v_triangle") == "v_triangle")
+        & (triangles["polar_method"] == "ridge")
         & (triangles["ridge_value"] == config.ridge_grid[0])
     ].drop_duplicates(["k", "j", "i"])
     rows: list[dict[str, object]] = []
@@ -453,10 +751,37 @@ def run_graph_connection(
     )
     triangles = run_triangles(weights, edges, communities, config)
     role = run_role_loops(weights, triangles, normalized_activations, config) if len(triangles) else pd.DataFrame()
+    surrogates = run_triangle_surrogates(weights, induction_heads, config)
     valid_triangles = triangles[
         triangles.get("local_error", pd.Series(index=triangles.index, dtype=object)).isna()
     ] if len(triangles) else triangles
-    ridge_triangles = valid_triangles[valid_triangles.get("polar_method", "") == "ridge"] if len(valid_triangles) else valid_triangles
+    real_rows = (
+        valid_triangles[
+            (valid_triangles.get("row_kind", "") == "v_triangle")
+            & (valid_triangles.get("polar_method", "") == "ridge")
+            & (valid_triangles.get("ridge_value", np.nan) == config.ridge_grid[0])
+        ]
+        if len(valid_triangles)
+        else valid_triangles
+    )
+    valid_surrogates = (
+        surrogates[
+            surrogates.get(
+                "local_error", pd.Series(index=surrogates.index, dtype=object)
+            ).isna()
+        ]
+        if len(surrogates)
+        else surrogates
+    )
+    summary_rows, classification = triangle_surrogate_summary(
+        weights.model_name, real_rows, valid_surrogates
+    )
+    triangles = pd.concat(
+        [triangles, surrogates, pd.DataFrame(summary_rows)],
+        ignore_index=True,
+        sort=False,
+    )
+    ridge_triangles = real_rows
     observations = [
         f"The selected head graph had modularity {modularity:.3f}; its induction-overlap community contained {len(induction_community)} heads.",
         (
@@ -464,6 +789,7 @@ def run_graph_connection(
             if len(ridge_triangles)
             else "No interpretable V-channel triangle was present at the configured edge budget."
         ),
+        classification,
         (
             f"Role-complete Q/K loop class functions varied across bridge families by median standard deviation {float(role['bridge_sensitivity'].median()):.3g}."
             if len(role) and "bridge_sensitivity" in role

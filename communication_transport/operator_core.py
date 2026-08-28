@@ -396,6 +396,7 @@ def _thomas_wigner_edge(
     intersection_dimension = int(np.count_nonzero(intersection_singular > 1.0 - 1.0e-7))
     return {
         "model": weights.model_name,
+        "arm": "single_edge",
         "edge_id": f"{weights.model_name}:{edge.writer}->{edge.reader}:V",
         "writer": edge.writer,
         "reader": edge.reader,
@@ -438,6 +439,272 @@ def run_thomas_wigner(
                         "edge_id": f"{weights.model_name}:{edge.writer}->{edge.reader}:V",
                         "writer": edge.writer,
                         "reader": edge.reader,
+                        "ridge": ridge,
+                        "local_error": f"{type(exc).__name__}: {exc}",
+                    }
+                )
+    return pd.DataFrame(rows)
+
+
+def _tw_aggregate_pair(
+    weights: ModelWeights,
+    pair_id: str,
+    reader_grams: list[torch.Tensor],
+    writer_grams: list[torch.Tensor],
+    model_operator: torch.Tensor | None,
+    ridge: float,
+    extra: dict[str, object],
+) -> dict[str, object]:
+    """The single-edge Thomas-Wigner extraction on pooled Gram states.
+
+    Pooled states genuinely share support, so this arm exercises the canonical
+    pair transport on its intended domain; the single-edge arm remains the
+    documented degenerate case (disjoint rank-64 supports, intersection zero).
+    """
+
+    G = sum(gram / torch.trace(gram) for gram in reader_grams)
+    H = sum(gram / torch.trace(gram) for gram in writer_grams)
+    G = 0.5 * (G + G.T)
+    H = 0.5 * (H + H.T)
+    values, vectors = torch.linalg.eigh(G / torch.trace(G) + H / torch.trace(H))
+    keep = values > 1.0e-10 * float(values.max())
+    basis = vectors[:, keep]
+    Gp = basis.T @ G @ basis
+    Hp = basis.T @ H @ basis
+    q = Gp / torch.trace(Gp)
+    K = Hp / torch.trace(Hp)
+    eye = torch.eye(len(q), dtype=torch.float64)
+    A = psd_sqrt(q + ridge * eye, rtol=0.0).numpy()
+    B = psd_sqrt(K + ridge * eye, rtol=0.0).numpy()
+    Qab, _ = _orthogonal_polar(A @ B)
+    E, explained = _dominant_plane(Qab)
+    AE = 0.5 * (E.T @ A @ E + E.T @ A.T @ E)
+    BE = 0.5 * (E.T @ B @ E + E.T @ B.T @ E)
+    det_a = max(float(np.linalg.det(AE)), 1.0e-300)
+    det_b = max(float(np.linalg.det(BE)), 1.0e-300)
+    AE /= math.sqrt(det_a)
+    BE /= math.sqrt(det_b)
+    amax, va = _major_eigenvector(AE)
+    bmax, vb = _major_eigenvector(BE)
+    if np.linalg.det(np.column_stack((va, np.array([-va[1], va[0]])))) < 0:
+        va = -va
+    delta = math.atan2(va[0] * vb[1] - va[1] * vb[0], float(va @ vb))
+    delta = ((delta + math.pi / 2) % math.pi) - math.pi / 2
+    t = 0.5 * math.log(max(amax, 1.0e-300) / max(1.0 / amax, 1.0e-300))
+    s = 0.5 * math.log(max(bmax, 1.0e-300) / max(1.0 / bmax, 1.0e-300))
+    p = math.tanh(t)
+    qg = math.tanh(s)
+    alpha = 2.0 * delta
+    predicted = math.atan2(
+        -math.sin(alpha) * p * qg,
+        1.0 + math.cos(alpha) * p * qg,
+    )
+    Qpair, _ = _orthogonal_polar(AE @ BE)
+    pair = _rotation_angle_2d(Qpair)
+    Qreverse, _ = _orthogonal_polar(BE @ AE)
+    reverse = _rotation_angle_2d(Qreverse)
+
+    # Support overlap between the pooled reader and writer states, which is
+    # the quantity that is identically zero at single-edge granularity.  The
+    # dimension-counting intersection rank(G) + rank(H) - rank(union) is the
+    # honest common-domain size; the cosine count records near-exact overlap.
+    g_values, g_vectors = torch.linalg.eigh(G)
+    h_values, h_vectors = torch.linalg.eigh(H)
+    g_basis = g_vectors[:, g_values > 1.0e-10 * float(g_values.max())]
+    h_basis = h_vectors[:, h_values > 1.0e-10 * float(h_values.max())]
+    overlap = np.linalg.svd((g_basis.T @ h_basis).numpy(), compute_uv=False)
+    intersection = max(
+        0, int(g_basis.shape[1]) + int(h_basis.shape[1]) - int(len(q))
+    )
+    near_exact_overlap = int(np.count_nonzero(overlap > 1.0 - 1.0e-7))
+
+    row: dict[str, object] = {
+        "model": weights.model_name,
+        "arm": extra.pop("arm"),
+        "edge_id": pair_id,
+        "ridge": ridge,
+        "union_support_dimension": int(len(q)),
+        "intersection_support_dimension": intersection,
+        "near_exact_overlap_dimension": near_exact_overlap,
+        "reader_support_rank": int(g_basis.shape[1]),
+        "writer_support_rank": int(h_basis.shape[1]),
+        "t": t,
+        "s": s,
+        "delta": delta,
+        "alpha": alpha,
+        "phi_predicted": predicted,
+        "phi_pair": pair,
+        "pair_formula_residual": abs(
+            math.atan2(math.sin(pair - predicted), math.cos(pair - predicted))
+        ),
+        "phi_reverse": reverse,
+        "forward_reverse_oddness_residual": abs(
+            math.atan2(math.sin(pair + reverse), math.cos(pair + reverse))
+        ),
+        "envelope": abs(p * qg),
+        "dominant_plane_compact_energy_fraction": explained,
+        **extra,
+    }
+    if model_operator is not None:
+        full_plane = basis.numpy() @ E
+        plane_t = torch.from_numpy(full_plane).to(dtype=torch.float64)
+        model_2 = (plane_t.T @ model_operator @ plane_t).numpy()
+        Qmodel, _ = _orthogonal_polar(model_2)
+        model_angle = _rotation_angle_2d(Qmodel)
+        row["phi_model"] = model_angle
+        row["model_prediction_residual"] = abs(
+            math.atan2(
+                math.sin(model_angle - predicted), math.cos(model_angle - predicted)
+            )
+        )
+        row["envelope_occupancy"] = abs(math.sin(model_angle)) / max(
+            abs(p * qg), 1.0e-12
+        )
+    return row
+
+
+def _aggregate_model_operator(
+    weights: ModelWeights,
+    edge_pairs: list[tuple[str, str]],
+) -> torch.Tensor | None:
+    if not edge_pairs:
+        return None
+    operator = torch.zeros(weights.d_model, weights.d_model, dtype=torch.float64)
+    for writer, reader in edge_pairs:
+        wl, wh = parse_head(writer)
+        rl, rh = parse_head(reader)
+        operator += (
+            weights.O[rl, rh]
+            @ (weights.V[rl, rh].T @ weights.O[wl, wh])
+            @ weights.V[wl, wh].T
+        )
+    return operator
+
+
+def run_thomas_wigner_aggregate(
+    weights: ModelWeights,
+    edges: pd.DataFrame,
+    communities: pd.DataFrame,
+    config: RunConfig,
+    max_operator_edges: int = 24,
+) -> pd.DataFrame:
+    """Aggregate Thomas-Wigner arm on layer-pooled and community-pooled Grams."""
+
+    selected_v = edges[
+        (edges.get("edge_class", "") == "head_head_V")
+        & edges.get("selected", pd.Series(False, index=edges.index)).fillna(False)
+    ]
+    all_v = edges[edges.get("edge_class", "") == "head_head_V"]
+    ridge = config.ridge_grid[0]
+    rows: list[dict[str, object]] = []
+
+    def edge_pairs_between(writer_layers: set[int], reader_layers: set[int]):
+        pool = selected_v[
+            selected_v["writer_layer"].isin(writer_layers)
+            & selected_v["reader_layer"].isin(reader_layers)
+        ]
+        fallback = False
+        if not len(pool):
+            pool = all_v[
+                all_v["writer_layer"].isin(writer_layers)
+                & all_v["reader_layer"].isin(reader_layers)
+            ]
+            fallback = True
+        pool = pool.nlargest(min(max_operator_edges, len(pool)), "C")
+        return [
+            (str(row.writer), str(row.reader)) for row in pool.itertuples()
+        ], fallback
+
+    def head_grams(labels: list[str]):
+        readers, writers = [], []
+        for label in labels:
+            layer, head = parse_head(label)
+            V, O = weights.V[layer, head], weights.O[layer, head]
+            readers.append(V @ (O.T @ O) @ V.T)
+            writers.append(O @ (V.T @ V) @ O.T)
+        return readers, writers
+
+    layer_heads = {
+        layer: [weights.head_label(layer, head) for head in range(weights.n_heads)]
+        for layer in range(weights.n_layers)
+    }
+    for writer_layer in range(weights.n_layers - 1):
+        for reader_layer in range(writer_layer + 1, weights.n_layers):
+            reader_grams, _ = head_grams(layer_heads[reader_layer])
+            _, writer_grams = head_grams(layer_heads[writer_layer])
+            pairs, fallback = edge_pairs_between({writer_layer}, {reader_layer})
+            try:
+                rows.append(
+                    _tw_aggregate_pair(
+                        weights,
+                        f"{weights.model_name}:L{writer_layer}->L{reader_layer}:V_pool",
+                        reader_grams,
+                        writer_grams,
+                        _aggregate_model_operator(weights, pairs),
+                        ridge,
+                        {
+                            "arm": "aggregate_layer_pool",
+                            "writer_layer": writer_layer,
+                            "reader_layer": reader_layer,
+                            "model_operator_edges": len(pairs),
+                            "model_operator_from_unselected_fallback": fallback,
+                        },
+                    )
+                )
+            except Exception as exc:
+                rows.append(
+                    {
+                        "model": weights.model_name,
+                        "arm": "aggregate_layer_pool",
+                        "writer_layer": writer_layer,
+                        "reader_layer": reader_layer,
+                        "ridge": ridge,
+                        "local_error": f"{type(exc).__name__}: {exc}",
+                    }
+                )
+
+    members = sorted(
+        communities.loc[
+            communities.get("is_induction_community", pd.Series(False, index=communities.index)).fillna(False),
+            "head",
+        ].tolist(),
+        key=lambda label: parse_head(label),
+    ) if len(communities) else []
+    if len(members) >= 4:
+        layers = sorted(parse_head(label)[0] for label in members)
+        split = layers[len(layers) // 2]
+        writer_half = [label for label in members if parse_head(label)[0] < split]
+        reader_half = [label for label in members if parse_head(label)[0] >= split]
+        if len(writer_half) >= 2 and len(reader_half) >= 2:
+            reader_grams, _ = head_grams(reader_half)
+            _, writer_grams = head_grams(writer_half)
+            pairs, fallback = edge_pairs_between(
+                {parse_head(label)[0] for label in writer_half},
+                {parse_head(label)[0] for label in reader_half},
+            )
+            try:
+                rows.append(
+                    _tw_aggregate_pair(
+                        weights,
+                        f"{weights.model_name}:induction_community_split:V_pool",
+                        reader_grams,
+                        writer_grams,
+                        _aggregate_model_operator(weights, pairs),
+                        ridge,
+                        {
+                            "arm": "aggregate_community_pool",
+                            "community_writer_half": writer_half,
+                            "community_reader_half": reader_half,
+                            "model_operator_edges": len(pairs),
+                            "model_operator_from_unselected_fallback": fallback,
+                        },
+                    )
+                )
+            except Exception as exc:
+                rows.append(
+                    {
+                        "model": weights.model_name,
+                        "arm": "aggregate_community_pool",
                         "ridge": ridge,
                         "local_error": f"{type(exc).__name__}: {exc}",
                     }

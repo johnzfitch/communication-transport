@@ -106,6 +106,7 @@ def model_summary(name: str, model) -> dict[str, object]:
         "positional_scheme": str(cfg.positional_embedding_type),
         "rotary_dim": int(getattr(cfg, "rotary_dim", 0) or 0),
         "rotary_base": float(getattr(cfg, "rotary_base", 10_000.0) or 10_000.0),
+        "rotary_adjacent_pairs": bool(getattr(cfg, "rotary_adjacent_pairs", False)),
         "parallel_attn_mlp": bool(getattr(cfg, "parallel_attn_mlp", False)),
         "residual_topology": (
             "parallel_attention_mlp"
@@ -240,7 +241,15 @@ def evaluate_behavior(
 
 def detect_induction_heads(
     model, corpora: Corpora, config: RunConfig, topk: int = 5
-) -> tuple[list[str], dict[str, float]]:
+) -> tuple[list[str], dict[str, float], dict[str, float]]:
+    """Score every head at the induction and the duplicate-token offsets.
+
+    With sequence [BOS, t_0..t_{B-1}, t_0..t_{B-1}], an induction head at the
+    second-copy query t_k attends to the token AFTER the previous occurrence,
+    i.e. offset -(B-1).  Offset -B is the duplicate-token pattern; it is kept
+    as its own stored score because duplicate-token heads are useful labels.
+    """
+
     names = {
         f"blocks.{layer}.attn.hook_pattern"
         for layer in range(model.cfg.n_layers)
@@ -248,8 +257,9 @@ def detect_induction_heads(
     sums = torch.zeros(
         model.cfg.n_layers, model.cfg.n_heads, dtype=torch.float64
     )
+    dup_sums = torch.zeros_like(sums)
     counts = 0
-    offset = corpora.block_size
+    offset = corpora.block_size - 1
     with torch.no_grad():
         for start in range(0, len(corpora.induction), config.batch_size):
             toks = corpora.induction[start : start + config.batch_size]
@@ -261,12 +271,19 @@ def detect_induction_heads(
             for layer in range(model.cfg.n_layers):
                 pattern = cache[f"blocks.{layer}.attn.hook_pattern"]
                 diagonal = pattern.diagonal(offset=-offset, dim1=2, dim2=3)
-                # Only receiver positions in the copied block contribute.
-                score = diagonal[..., 1:].mean(dim=(0, 2)).double().cpu()
+                # Only receiver positions in the copied block contribute; the
+                # first two diagonal entries are first-block queries.
+                score = diagonal[..., 2:].mean(dim=(0, 2)).double().cpu()
                 sums[layer] += score * toks.shape[0]
+                duplicate = pattern.diagonal(
+                    offset=-(offset + 1), dim1=2, dim2=3
+                )
+                dup_score = duplicate[..., 1:].mean(dim=(0, 2)).double().cpu()
+                dup_sums[layer] += dup_score * toks.shape[0]
             counts += toks.shape[0]
             del cache
     scores = sums / max(counts, 1)
+    dup_scores = dup_sums / max(counts, 1)
     flat = [
         (float(scores[layer, head]), layer, head)
         for layer in range(model.cfg.n_layers)
@@ -279,7 +296,12 @@ def detect_induction_heads(
         for layer in range(model.cfg.n_layers)
         for head in range(model.cfg.n_heads)
     }
-    return labels, score_map
+    dup_map = {
+        f"L{layer}H{head}": float(dup_scores[layer, head])
+        for layer in range(model.cfg.n_layers)
+        for head in range(model.cfg.n_heads)
+    }
+    return labels, score_map, dup_map
 
 
 def cache_activations(

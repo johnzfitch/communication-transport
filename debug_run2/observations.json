@@ -1,0 +1,54 @@
+{
+  "A": [
+    "Dense and factored head couplings agreed to a maximum absolute residual of 1.110e-16.",
+    "The empirical head graph selected 55 high-coupling edges and identified 0 avoidant edges.",
+    "All 6 constructible mixed classes were fully scanned and retained 1500 bounded tail records; learned-position classes are not constructible for this rotary model.",
+    "The full neuron-neuron scan retained 2000 strongest signed wires; the table is explicitly bounded while span histograms describe every candidate."
+  ],
+  "B": [
+    "Every retained small core reconstructed C with maximum residual 5.967e-16.",
+    "The rank-two Thomas-Wigner formula reproduced its projected positive-pair polar angle with maximum angular residual 4.441e-16 radians.",
+    "Real V-composition orientations differed from the canonical pair prediction by a median 1.987 radians.",
+    "Aggregate pooled-Gram Thomas-Wigner pairs had genuine common support (median intersection 510) and reproduced the rank-two pair law to 3.053e-16 radians.",
+    "Sign flips left affected Gram couplings unchanged to 0.000e+00 while changing induction gain by a median 19.8%.",
+    "Spectrum flattening moved outgoing scalar couplings by a median 9.9% and changed induction gain by a median 0.2%.",
+    "Mean-ablation of the induction community destroyed 21.7% of the measured induction gain.",
+    "The Gibbs state metric assigned sign flips at most 0.000e+00 energy, exposing its structural blindness to orientation.",
+    "Spectrum flattening carried median spectral energy 7.029e-01 and median frame energy 1.200e-29."
+  ],
+  "C": [
+    "The selected head graph had modularity 0.393; its induction-overlap community contained 5 heads.",
+    "V-channel triangles had median compact score 59.5 and median symmetric path residual 0.965.",
+    "Real triangles sit below the surrogate distribution in compact (|separation| >= 2 robust sigma), consistent with partial parallel transport with reduced compact residue; all other registers match the surrogate null.",
+    "Role-complete Q/K loop class functions varied across bridge families by median standard deviation 0.186.",
+    "Activation-derived polar transports generalized with median held-out R2 0.010 at the middle anchor.",
+    "Fitted transport collapsed span-center variance by median fraction 0.988 against a token-permuted fit-anything floor of 0.993; the identity control returned collapse 1.55e-14 and covariant-coupling residual 1.39e-16.",
+    "Pooled versus span-stratified selected-edge overlap changed from 0.288 to 0.766 after transport."
+  ],
+  "D": [
+    "The positional-specificity rule selected pooled bands [9, 10] in EleutherAI/pythia-70m.",
+    "Across balanced and diagonal rebalancing gauges the selected planes had minimum principal cosine 0.034, and their joined support had rank 8.",
+    "Bootstrap refits had median minimum principal cosine 0.306 to the trained PosRatio plane.",
+    "Exact RoPE loops closed with residual 7.346e-16; this is the flat positional control.",
+    "The rotary block allocated 8 planes, had finite-window dictionary rank 13, and left 48 head coordinates position-transparent.",
+    "After exact flat subtraction, learned role-complete loops had median compact score 59.8 and median positive-log norm 79.5."
+  ],
+  "E": [
+    "Across nonsaturated generator spans, the smallest measured closure defect was 0.878219; saturated full-so(m) rows are labeled separately.",
+    "Against matched random k-planes the largest excess closure was 0.0042 at ambient 26, generator dimension 5 (learned 0.9874 vs baseline 0.9916 +- 0.0044); closure is mostly codimension.",
+    "The closest listed candidate was so(3)_plus_trivial_5 at normalized chordal distance 0.999; this is an identification comparison, not an exceptional claim.",
+    "Exact dimension-52 classical impostors and the marked compact F4 control all closed numerically; dimension and closure alone therefore did not identify F4."
+  ],
+  "F": [
+    "The 1 evaluated triples had median induction inclusion-exclusion synergy -0.0413.",
+    "The configured triple count was too small for a held-out causal-synergy model.",
+    "Potential coupling and realized absolute traffic had Pearson correlation 0.141 over 55 selected edges.",
+    "Among the strongest-potential examples, 0.0% fell below their channel's median realized traffic on the sampled inputs.",
+    "Causal survival curves were computed for 3 top edges by removing the writer contribution at the reader input and following the resulting perturbation."
+  ],
+  "G": [
+    "The compact Albert control split random bivectors into mean 52-fraction 0.177 and mean 273-fraction 0.823.",
+    "The Albert and hostile spin controls exposed derivation/complement dimensions 52+273 and 300+25 with sampled closure defects 1.02e-30 and 0.",
+    "No model-derived marking was supplied, so this branch makes no claim about an Albert signal in a transformer carrier."
+  ]
+}

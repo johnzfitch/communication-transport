@@ -66,6 +66,12 @@ def _triangle_set(triangles: pd.DataFrame, limit: int) -> list[tuple[str, str, s
             "local_error", pd.Series(index=triangles.index, dtype=object)
         ).isna()
     ]
+    if "row_kind" in valid:
+        # Surrogate-model triangles are not circuit paths of the real model;
+        # matched outside-community controls are and give the synergy strata.
+        valid = valid[
+            valid["row_kind"].isin(["v_triangle", "v_triangle_matched_control"])
+        ]
     if "polar_method" in valid:
         preferred = valid[valid["polar_method"] == "ridge"]
         if len(preferred):

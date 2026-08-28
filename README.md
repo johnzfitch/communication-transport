@@ -16,3 +16,10 @@ git clone https://github.com/johnzfitch/communication-transport.git
 ```
 
 The exact run settings are in [config.json](config.json), and [observations.json](observations.json) provides the machine-readable observation summary.
+
+## Experiment runtime
+
+The Python source used for the run is included in
+[`communication_transport/`](communication_transport/). The captured Python and
+package versions are in [`runtime-environment.txt`](runtime-environment.txt).
+Generated Python bytecode and test caches are intentionally excluded.

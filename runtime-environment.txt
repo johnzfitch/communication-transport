@@ -1,0 +1,22 @@
+Runtime environment used for the published experiment
+=====================================================
+
+Python 3.14.6
+
+datasets==5.0.1
+matplotlib==3.11.1
+networkx==3.6.1
+numpy==2.5.2
+pandas==3.0.5
+pyarrow==25.0.1
+scipy==1.18.0
+torch==2.13.0+cu130
+transformer-lens==3.8.0
+transformers==5.15.0
+
+Test runner:
+pytest==9.1.1
+
+Local runtime dependency:
+The optional exceptional_branch experiment imports engine.readers from the
+companion Albert engine source tree. That package is not vendored here.
